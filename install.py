@@ -1,9 +1,10 @@
 """
-Installs the fly-by camera mod into Train Sim World 7.
+Installs the fly-by camera and comfort HUD mods into Train Sim World 7.
 
-    python install.py                      copy the mod into the game (UE4SS must be installed)
-    python install.py --ue4ss UE4SS.zip    install UE4SS from its release zip first, then the mod
-    python install.py --uninstall          take the mod out of the game
+    python install.py                      copy both mods into the game (UE4SS must be installed)
+    python install.py --mod ComfortHUD     just that one (FlyByCamera or ComfortHUD)
+    python install.py --ue4ss UE4SS.zip    install UE4SS from its release zip first, then the mods
+    python install.py --uninstall          take the mods out of the game (with --mod, just that one)
     python install.py --remove-ue4ss       take UE4SS and every UE4SS mod out of the game
 
 The game is found through Steam; --game-dir points at its Binaries\\Win64 folder instead.
@@ -21,8 +22,7 @@ import zipfile
 import winreg
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MOD_NAME = "FlyByCamera"
-MOD_SOURCE = os.path.join(HERE, MOD_NAME)
+MODS = {"FlyByCamera": "Fly-by camera", "ComfortHUD": "Comfort HUD"}   # folder: what it's called
 GAME_WIN64 = os.path.join("steamapps", "common", "Train Sim World 7", "WindowsNoEditor",
                           "TS2Prototype", "Binaries", "Win64")
 GAME_EXE = "TrainSimWorld.exe"
@@ -35,7 +35,7 @@ SETTINGS = {
     "EnableHotReloadSystem": "0",
 }
 
-# UE4SS's sample mods, switched off: the fly-by camera needs none of them, and Keybinds puts object dumps
+# UE4SS's sample mods, switched off: the mods here need none of them, and Keybinds puts object dumps
 # on Ctrl+J, Ctrl+H and Ctrl+number pad keys. Turn any back on in ue4ss\Mods\mods.txt.
 SAMPLE_MODS_OFF = ("CheatManagerEnablerMod", "ConsoleCommandsMod", "ConsoleEnablerMod",
                    "BPML_GenericFunctions", "BPModLoaderMod", "Keybinds")
@@ -162,27 +162,27 @@ def set_up_ue4ss(win64):
         edit_file(mods_txt, samples_off)
 
 
-def install_mod(win64):
+def install_mod(win64, mod):
     mods = os.path.join(ue4ss_dir(win64), "Mods")
-    target = os.path.join(mods, MOD_NAME)
+    target = os.path.join(mods, mod)
     if os.path.isdir(target):
         shutil.rmtree(target)
-    shutil.copytree(MOD_SOURCE, target)
+    shutil.copytree(os.path.join(HERE, mod), target)
     mods_txt = os.path.join(mods, "mods.txt")
     if os.path.isfile(mods_txt):
-        edit_file(mods_txt, lambda t: set_mod_line(t, MOD_NAME, True))
-    print(f"Fly-by camera installed into {target}")
+        edit_file(mods_txt, lambda t: set_mod_line(t, mod, True))
+    print(f"{MODS[mod]} installed into {target}")
 
 
-def uninstall_mod(win64):
+def uninstall_mod(win64, mod):
     mods = os.path.join(ue4ss_dir(win64), "Mods")
-    target = os.path.join(mods, MOD_NAME)
+    target = os.path.join(mods, mod)
     if os.path.isdir(target):
         shutil.rmtree(target)
     mods_txt = os.path.join(mods, "mods.txt")
     if os.path.isfile(mods_txt):
-        edit_file(mods_txt, lambda t: set_mod_line(t, MOD_NAME, None))
-    print("Fly-by camera removed from the game.")
+        edit_file(mods_txt, lambda t: set_mod_line(t, mod, None))
+    print(f"{MODS[mod]} removed from the game.")
 
 
 def remove_ue4ss(win64):
@@ -195,9 +195,10 @@ def remove_ue4ss(win64):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Install the fly-by camera mod into Train Sim World 7.")
+    p = argparse.ArgumentParser(description="Install the fly-by camera and comfort HUD mods into Train Sim World 7.")
+    p.add_argument("--mod", action="append", choices=list(MODS), help="just this mod (both without it)")
     p.add_argument("--ue4ss", metavar="ZIP", help="install UE4SS from this release zip first")
-    p.add_argument("--uninstall", action="store_true", help="take the mod out of the game")
+    p.add_argument("--uninstall", action="store_true", help="take the mods out of the game")
     p.add_argument("--remove-ue4ss", action="store_true", help="take UE4SS and all its mods out of the game")
     p.add_argument("--game-dir", help="the game's Binaries\\Win64 folder, if Steam can't find it")
     args = p.parse_args()
@@ -210,15 +211,22 @@ def main():
 
     if args.remove_ue4ss:
         return remove_ue4ss(win64)
+    mods = args.mod or list(MODS)
     if args.uninstall:
-        return uninstall_mod(win64)
+        for mod in mods:
+            uninstall_mod(win64, mod)
+        return
     if args.ue4ss:
         install_ue4ss(args.ue4ss, win64)
     if not has_ue4ss(win64):
         sys.exit("UE4SS isn't installed in the game yet. Run again with --ue4ss and its release zip.")
     set_up_ue4ss(win64)
-    install_mod(win64)
-    print("Start the game, load a drive and press 7.")
+    for mod in mods:
+        install_mod(win64, mod)
+    if "FlyByCamera" in mods:
+        print("Fly-by camera: load a drive and press 7.")
+    if "ComfortHUD" in mods:
+        print("Comfort HUD: load a drive; the objective box at the top shows the passengers and comfort.")
 
 
 if __name__ == "__main__":

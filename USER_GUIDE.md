@@ -18,6 +18,8 @@ Pressing one of the game's own camera keys also hands the view back: 1 (cab), 2 
 
 TSW7 doesn't bind 6, 7 or F10 itself.
 
+The other mod here, the comfort HUD, puts passenger numbers and comfort warnings in the game's objective box: see [its guide](COMFORT_HUD_GUIDE.md).
+
 ## Before you start
 
 The mod is a script that runs inside the game through **UE4SS**, a free, open-source tool for scripting Unreal Engine games. TSW7 has no official way to add camera views, so UE4SS is needed.
@@ -32,11 +34,13 @@ UE4SS's builds are on its [releases page](https://github.com/UE4SS-RE/RE-UE4SS/r
 
 ## Installing
 
-Close the game first. Then either double-click **Install fly-by camera.bat** (UE4SS already installed), or install UE4SS and the mod together:
+Close the game first. Then either double-click **Install fly-by camera.bat** (UE4SS already installed), or install UE4SS and the mods together:
 
 ```
 python install.py --ue4ss "F:\TSW mod downloads\ue4ss-zip\UE4SS_v3.0.1-1181-g83330635.zip"
 ```
+
+That installs both mods, the fly-by camera and the comfort HUD. Add `--mod FlyByCamera` for just the fly-by camera.
 
 The installer finds the game through Steam and puts these next to `TrainSimWorld.exe` in `...\Train Sim World 7\WindowsNoEditor\TS2Prototype\Binaries\Win64`:
 
@@ -97,7 +101,7 @@ Pressing **F10** in a drive adds a report: which vehicle it would follow, everyt
 **The camera is somewhere odd:** the `new spot` and `train at` lines show where the train was and what the mod found there.
 
 **Removing:**
-- **Uninstall fly-by camera.bat** removes the mod and leaves UE4SS.
+- **Uninstall fly-by camera.bat** removes the mod and leaves UE4SS and the comfort HUD.
 - `python install.py --remove-ue4ss` removes UE4SS and all its mods.
 
 ## What's been seen in the game

@@ -90,6 +90,29 @@ class Installing(unittest.TestCase):
         self.assertIn("EnableHotReloadSystem = 0", settings)
         self.assertIn("ConsoleEnabled = 1", self.read("ue4ss", "UE4SS-settings.ini.original"))
 
+    def test_both_mods_by_default(self):
+        self.install("--ue4ss", self.zip)
+        mods = self.read("ue4ss", "Mods", "mods.txt")
+        self.assertIn("ComfortHUD : 1", mods)
+        for mod in ("FlyByCamera", "ComfortHUD"):
+            self.assertTrue(os.path.isfile(os.path.join(self.win64, "ue4ss", "Mods", mod, "enabled.txt")))
+        self.assertTrue(os.path.isfile(os.path.join(self.win64, "ue4ss", "Mods", "ComfortHUD", "Scripts",
+                                                    "comfort_judge.lua")))
+
+    def test_one_mod(self):
+        self.install("--ue4ss", self.zip, "--mod", "ComfortHUD")
+        self.assertTrue(os.path.isdir(os.path.join(self.win64, "ue4ss", "Mods", "ComfortHUD")))
+        self.assertFalse(os.path.exists(os.path.join(self.win64, "ue4ss", "Mods", "FlyByCamera")))
+        self.assertNotIn("FlyByCamera", self.read("ue4ss", "Mods", "mods.txt"))
+
+    def test_uninstall_one_leaves_the_other(self):
+        self.install("--ue4ss", self.zip)
+        self.install("--uninstall", "--mod", "ComfortHUD")
+        mods = self.read("ue4ss", "Mods", "mods.txt")
+        self.assertNotIn("ComfortHUD", mods)
+        self.assertIn("FlyByCamera : 1", mods)
+        self.assertTrue(os.path.isdir(os.path.join(self.win64, "ue4ss", "Mods", "FlyByCamera")))
+
     def test_updating_ue4ss_keeps_the_settings_and_mod_list(self):
         self.install("--ue4ss", self.zip)
         with open(os.path.join(self.win64, "ue4ss", "Mods", "mods.txt"), "a", encoding="utf-8") as f:
