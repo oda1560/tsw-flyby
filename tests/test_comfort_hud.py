@@ -10,11 +10,14 @@ with pip --target.
 
 import os
 import sys
+import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(ROOT, "ComfortHUD", "Scripts").replace("\\", "/")
 TESTS = os.path.join(ROOT, "tests").replace("\\", "/")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gvas  # noqa: E402
 
 try:
     from lupa import lua54
@@ -30,10 +33,14 @@ DOT = " \u00b7 "
 
 @unittest.skipIf(lua54 is None, "needs lupa: pip install lupa")
 class ComfortHUD(unittest.TestCase):
-    def start(self, settings=None, load=True, **sim):
-        """The game with a train, the mod loaded into it, then the drive loading (load=True)."""
+    def start(self, settings=None, load=True, saves=None, **sim):
+        """The game with a train, the mod loaded into it, then the drive loading (load=True). `saves`: the game's save
+        files, as install.py tells the mod where they are."""
         self.lua = lua54.LuaRuntime(unpack_returned_tuples=True)
         self.lua.execute(f'package.path = "{SCRIPTS}/?.lua;{TESTS}/?.lua;" .. package.path')
+        if saves is not None:
+            self.lua.globals().SAVE_LIST = self.lua.table_from(saves)
+            self.lua.execute('package.preload["comfort_save_files"] = function() return SAVE_LIST end')
         self.sim = self.lua.eval('(require("fake_comfort_game"))')
         self.lua.globals().Sim = self.sim
         sim = {k: self.lua.table_from(v) if isinstance(v, list) else v for k, v in sim.items()}
@@ -202,6 +209,220 @@ class ComfortHUD(unittest.TestCase):
         self.run_at(6)
         self.assertIn("service 2W09", self.logs())
         self.assertTrue(self.shown()[1].endswith("comfort 100"), self.shown())    # the ride going on, on 2W09
+
+    # ---- the game's saves
+
+    def with_saves(self, folder=None, **kw):
+        """The game's save and checkpoint, from the day before, then the mod and the drive (start)."""
+        if folder is None:
+            folder = tempfile.mkdtemp()
+            for name in ("TSWSaveGame_abc.sav", "TSWCheckpointSaveGame_abc.sav"):
+                gvas.write_save(os.path.join(folder, name), "1M56", 63876686400.0)    # 2025-03-04 12:00
+        self.folder = folder
+        self.save = os.path.join(folder, "TSWSaveGame_abc.sav").replace("\\", "/")
+        self.checkpoint = os.path.join(folder, "TSWCheckpointSaveGame_abc.sav").replace("\\", "/")
+        self.start(saves=[self.save, self.checkpoint], **kw)
+
+    def day(self):
+        return self.sim.day0 + self.sim.time
+
+    def game_saves(self, path, service="1M56"):
+        """The game writing its save or checkpoint as the drive is now; the time of day it was made at."""
+        at = self.day()
+        gvas.write_save(path, service, at)
+        return at
+
+    def kept(self, path):
+        with open(path.replace(".sav", ".comfort"), encoding="utf-8") as f:
+            return f.read()
+
+    def to_station(self, rate=0.7):
+        """Drives off, stops at `rate` m/s² (0.7: easing off, smooth; 1.0: a jolt) and stands at a station."""
+        self.drive_off(to=8.0)
+        if rate < 0.9:
+            self.stop(rate, ease_below=2.5, eased=0.3)
+        else:
+            self.stop(rate)
+        self.sim.objective("LOAD PASSENGERS", "Wait until 19:12:30")
+        self.run_at(3)
+
+    def test_kept_beside_the_checkpoint_made_on_arriving(self):
+        self.with_saves()
+        self.assertIn("keeping the comfort beside the game's saves: TSWSaveGame_abc.sav, "
+                      "TSWCheckpointSaveGame_abc.sav", self.logs())
+        self.to_station()
+        self.drive_off()                                  # the ride to the first station done
+        self.to_station(1.0)                              # a jolt at the second
+        self.game_saves(self.checkpoint)
+        self.run_at(2)
+        self.assertIn("the game's time of day: 2025-03-05 19:00:0", self.logs())
+        self.assertIn("kept with the game's checkpoint of 1M56 at 19:0", self.logs())
+        self.assertIn(": 1 ride done, comfort 100", self.logs())
+        text = self.kept(self.checkpoint)
+        self.assertIn('service = "1M56"', text)
+        self.assertIn('stop = "jolt"', text)              # the ride going on, to this station
+        self.assertIn("station = true", text)
+        self.assertNotIn("TSWSaveGame_abc.comfort", os.listdir(self.folder))   # the game's own save wasn't written
+
+    def test_put_back_when_the_checkpoint_is_loaded(self):
+        self.with_saves()
+        self.to_station()
+        self.drive_off()
+        self.to_station(1.0)
+        at = self.game_saves(self.checkpoint)
+        self.run_at(2)
+        self.drive_off()                                  # the ride with the jolt done: comfort below 100
+        self.run_at(3, -1.4)                              # and harsh braking after
+        self.assertIn("1M56 so far 9", self.logs())
+        self.sim.new_world(at + 0.4)                      # the checkpoint loaded: back at the second station
+        self.sim.load_hud()
+        self.sim.objective("LOAD PASSENGERS", "Wait until 19:12:30")
+        self.run_at(3)
+        self.assertIn("the game's checkpoint of 1M56 at 19:0", self.logs())
+        self.assertIn(" loaded: back to 1 ride done, comfort 100", self.logs())
+        self.sim.objective("DRIVE TO SAPPHIRE", "Arrive by 19:20:00")
+        self.drive_off()                                  # leaving the station ends the ride with the jolt again
+        logs = self.logs()
+        self.assertEqual(logs.count("over 2 rides"), 2)   # once before the load, once after: not a third ride
+        self.assertNotIn("harsh", logs[logs.index("loaded: back to"):])
+
+    def test_put_back_when_the_game_sets_its_time_of_day_late(self):
+        self.with_saves()
+        self.to_station()
+        self.drive_off()
+        self.to_station(1.0)
+        at = self.game_saves(self.checkpoint)
+        self.run_at(2)
+        self.drive_off()
+        self.sim.new_world(at - 3600)                     # aboard at the service's start time at first ...
+        self.sim.load_hud()
+        self.run_at(2)
+        self.sim.day0 = at + 0.4 - self.sim.time          # ... then the save's
+        self.run_at(6)
+        self.assertIn(" loaded: back to 1 ride done, comfort 100", self.logs())
+
+    def test_the_time_of_day_written_out_if_the_datetime_can_t_be_read(self):
+        self.with_saves()
+        self.sim.datetime_empty = True
+        self.to_station()
+        self.drive_off()
+        self.to_station(1.0)
+        at = self.game_saves(self.checkpoint)
+        self.run_at(2)
+        self.assertIn("the game's time of day: 2025-03-05 19:00:0", self.logs())
+        self.assertIn("(GetLocalTimeOfDayAsString)", self.logs())
+        self.assertIn("kept with the game's checkpoint of 1M56", self.logs())
+        self.drive_off()
+        self.sim.new_world(at + 0.4)
+        self.sim.load_hud()
+        self.run_at(3)
+        self.assertIn(" loaded: back to 1 ride done, comfort 100", self.logs())
+
+    def test_carried_over_when_the_game_is_started_again(self):
+        self.with_saves()
+        self.to_station()
+        self.drive_off()
+        self.to_station(1.0)
+        self.sim.paused = True                            # Save in the menu
+        at = self.game_saves(self.save)
+        self.run_at(2)
+        self.assertIn("kept with the game's save of 1M56", self.logs())
+        self.with_saves(self.folder, day=at + 3.0)        # another evening: the game started again on that save
+        self.run_at(3)
+        self.assertIn("the game's save of 1M56 at 19:0", self.logs())
+        self.assertIn(" loaded: back to 1 ride done, comfort 100", self.logs())
+        self.assertRegex(self.shown()[1], "comfort 9[0-9]$")    # with the jolt in the ride going on
+
+    def test_saving_and_quitting_still_kept(self):
+        self.with_saves()
+        self.to_station()
+        self.drive_off()
+        self.sim.paused = True
+        self.game_saves(self.save)
+        self.sim.walked_off = True                        # the drive gone before the mod saw the save
+        self.run_at(2)
+        self.assertIn("not driving", self.logs())
+        self.assertIn("kept with the game's save of 1M56", self.logs())
+
+    def test_saved_while_stopping_kept_once_the_stop_is_judged(self):
+        self.with_saves()
+        self.drive_off(to=8.0)
+        self.sim.drive = lambda t, v: -1.0 if v > 0 else 0.0
+        while self.sim.v > 1.5:
+            self.sim.run(0.1)
+        self.game_saves(self.checkpoint)                  # the game saving as the train comes in
+        self.sim.run(10)
+        self.assertIn("kept with the game's checkpoint", self.logs())
+        self.assertIn('stop = "jolt"', self.kept(self.checkpoint))
+
+    def test_gone_back_with_nothing_kept(self):
+        self.with_saves()
+        start = self.day()
+        self.to_station()
+        self.drive_off()
+        self.to_station()
+        self.drive_off()
+        self.assertIn("over 2 rides", self.logs())
+        second_arrived = self.day() - 30
+        self.sim.new_world(second_arrived - 20)           # an older save, made without the mod
+        self.sim.load_hud()
+        self.run_at(3)
+        self.assertIn("nothing kept with a save there: 1 ride from after it dropped, 1 ride done", self.logs())
+        self.assertGreater(second_arrived - 20, start)
+
+    def test_another_save_there_since_isn_t_taken_for_the_one_kept(self):
+        self.with_saves()
+        self.to_station()
+        self.drive_off()
+        at = self.game_saves(self.checkpoint)
+        self.run_at(2)
+        self.assertIn("kept with the game's checkpoint", self.logs())
+        gvas.write_save(self.checkpoint, "1M56", at + 200)   # the game's next checkpoint, made with the mod off
+        self.sim.new_world(at + 200.5)
+        self.sim.load_hud()
+        self.run_at(3)
+        self.assertIn("on the game's checkpoint of 1M56", self.logs())
+        self.assertIn("nothing kept with it", self.logs())
+
+    def test_without_the_save_files_nothing_kept(self):
+        self.start()
+        self.assertIn("the game's save files aren't known", self.logs())
+        self.to_station()
+        self.drive_off()
+        self.assertNotIn("kept with the game", self.logs())
+        self.assertNotIn("GetDateTime", self.sim.calls)
+
+    def test_time_of_day_that_can_t_be_read(self):
+        self.with_saves()
+        self.sim.no_clock = True
+        self.to_station()
+        self.game_saves(self.checkpoint)
+        self.clear_calls()
+        self.run_at(40)
+        self.assertEqual(self.sim.log_count("can't read the game's time of day"), 1)
+        self.assertNotIn("kept with the game", self.logs())
+        self.assertLessEqual(self.sim.calls["GetDateTime"] or 0, 2)     # tried again every 30 s, not every look
+
+    def test_saves_switched_off_in_the_settings(self):
+        self.with_saves(settings={"KeepWithSaves": False})
+        self.to_station()
+        self.game_saves(self.checkpoint)
+        self.run_at(2)
+        self.assertNotIn("kept with the game", self.logs())
+        self.assertNotIn("keeping the comfort beside", self.logs())
+
+    def test_few_game_calls_with_saves_kept(self):
+        """The time of day is read on getting aboard and every 30 s after, a few calls each time; the time once more
+        a second."""
+        self.with_saves()
+        self.drive_off()
+        self.clear_calls()
+        self.run_at(60)
+        calls = {k: v for k, v in self.sim.calls.items()}
+        self.assertLessEqual(calls.pop("GetTimeSeconds"), 3600 + 60)
+        self.assertEqual(calls.pop("GetVelocity"), 3600)
+        self.assertLessEqual(calls.pop("GetDateTime"), 2)
+        self.assertLessEqual(sum(calls.values()), 6 * 60 + 2 * 4, calls)
 
     # ---- trains without passengers, and what can't be read
 
@@ -411,6 +632,18 @@ class ComfortHUD(unittest.TestCase):
         self.assertNotIn("(train:", self.logs())
         self.assertIn("passenger cars: 2", self.logs())
         self.assertIn("HUDObjectiveWidget_Minimal_C, shown", self.logs())
+
+    def test_report_on_the_saves(self):
+        self.with_saves()
+        self.to_station()
+        self.game_saves(self.checkpoint)
+        self.run_at(2)
+        self.sim.press("F11")
+        self.assertIn("the game's time of day: 2025-03-05 19:0", self.logs())
+        self.assertIn("TSWCheckpointSaveGame_abc.sav: 1M56 at 2025-03-05 19:0", self.logs())
+        self.assertIn("kept beside it: 1M56 at 2025-03-05", self.logs())
+        self.assertIn("TSWSaveGame_abc.sav: 1M56 at 2025-03-04 ", self.logs())
+        self.assertNotIn("(saves:", self.logs())
 
     def test_debug_line(self):
         self.start()

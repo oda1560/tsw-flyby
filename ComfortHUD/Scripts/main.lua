@@ -6,6 +6,10 @@
 -- Press = to switch it off and on, F11 for a report. Everything it does is written to UE4SS.log, lines starting
 -- [Comfort].
 --
+-- The comfort so far goes with the game's saves: each time the game writes its save or its checkpoint, the rides
+-- done and the ride going on are kept in a .comfort file beside it (comfort_saves.lua), and when a save is loaded
+-- (the game's time of day jumps to just after one) the comfort goes back to what was kept with it.
+--
 -- It reads everything from the game itself: no window over the game and no requests to the game's web API. Each
 -- frame it asks the game two things, the time and the train's velocity; the rest is its own arithmetic, and the
 -- objective box's text is only written when the words change. Searches through all the game's objects take
@@ -15,12 +19,26 @@
 -- TrainSimWorld.exe: RailVehicle GetFormation(EActorConnectionIterationMode) -> the vehicles of the train;
 -- PassengerCargoModelComponent GetPassengerCount() -> int; PlayerController GetDrivenServiceName(out FName);
 -- PhysicsFunctionLibrary GetSimulationNodeParameterAsBool(context, {{component, node}, {pin, name}}), the way the
--- game's own blueprints read a train's simulation (pin -1, by name).
+-- game's own blueprints read a train's simulation (pin -1, by name); TS2GameplayFunctionLibrary GetDateTime(context,
+-- local) -> the time of day, as the header bar's clock reads it.
 
 local UEHelpers = require("UEHelpers")
 local J = require("comfort_judge")
 local T = require("hud_text")
 local S = require("comfort_settings")
+local C = require("comfort_saves")
+
+-- The game's save files, found by install.py as it installed the mod (comfort_save_files.lua): the comfort is kept
+-- beside them.
+local SAVE_FILES = {}
+do
+    local ok, files = pcall(require, "comfort_save_files")
+    if ok and type(files) == "table" then
+        for _, path in ipairs(files) do
+            if type(path) == "string" then SAVE_FILES[#SAVE_FILES + 1] = path end
+        end
+    end
+end
 
 local FEED_EVERY = 1 / 15       -- s between readings for the judge (tsw-joystick read 15 a second)
 local LOOK_EVERY = 1.0          -- s between looking at the train and the objective box
@@ -29,6 +47,14 @@ local COUNT_EVERY = 5.0         -- s between counting the passengers while stopp
 local CHECK_EVERY = 2.0         -- s between checking the game hasn't written over the box without a hook seeing it
 local REFIND_EVERY = 5.0        -- s at least between searches for the player or the objective box
 local DEBUG_EVERY = 5.0
+local SAVE_EVERY = 1.0          -- s between reading the start of the game's save files (saving and quitting, the game
+                                -- is gone 2 s later)
+local CLOCK_EVERY = 30.0        -- s between reading the game's time of day while the drive goes on (a new one: at once)
+local JUMP_SECONDS = 30.0       -- the time of day on more than this ahead of the wall clock: it jumped
+local RESUME_SECONDS = 120.0    -- a save is the one loaded if the time of day jumped to at most this after it
+local COPY_SECONDS = 15.0       -- a save is kept with the comfort read up to this long (game) after it was made ...
+local STOPPING_SECONDS = 10.0   -- ... once the stop going on as it was made has been judged, waiting at most this long
+local PENDING_SECONDS = 60.0    -- a save the drive doesn't come to the time of in this long isn't kept with it
 local MAX_CARS = 16
 local WHITE = { R = 1.0, G = 1.0, B = 1.0, A = 1.0 }
 local FRONT_TO_BACK = 0         -- EActorConnectionIterationMode::FrontToBack: GetFormation's whole train
@@ -687,6 +713,221 @@ local function feed(now, t)
 end
 
 ----------------------------------------------------------------------------------------------------
+-- The game's saves: each time the game writes one, the comfort so far is kept beside it; when one is loaded, the
+-- comfort goes back to what was kept with it. Which save was loaded is told by the game's time of day: it jumps to
+-- just after when that save was made. The rules are tsw-joystick's (SaveCopies, ComfortWatch.saves_step).
+
+local saves = {
+    files = {},                 -- each of the game's save files: path -> {service, at} as last read
+    looked = false,             -- they've been read once
+    read_at = -math.huge,
+    day = nil,                  -- the game's time of day less its game time (s), measured on this drive
+    day_at = -math.huge,        -- ... when (wall clock)
+    t = nil,                    -- the game's time at the last look
+    world = true,               -- another drive (or the mod just started): its time of day not read yet
+    world_at = -math.huge,      -- ... when it was first read (wall clock)
+    clock = nil, clock_at = nil,  -- the time of day at the last look, and the wall clock then
+    jump = nil,                 -- the time of day jumped (a save loaded, another drive, the mod just started), until
+                                --   the saves are looked at: {from = the time of day before, nil at the start}
+    pending = {},               -- saves the game has written, to keep the comfort with once the drive's at their
+                                --   time: path -> {service, at, seen (wall clock)}
+    kept = 0, restores = 0,
+    clock_failed = false, write_failed = false,
+}
+
+-- The game's time of day as its clock in the header bar has it (GetDateTime, local): what's in the FDateTime it gives
+-- is read with the engine's maths library, the year, the day and the seconds into it. nil and why if it can't be.
+local function day_from_datetime(pc)
+    local lib = library_for("GetDateTime")
+    if not lib then return nil, "GetDateTime wasn't found" end
+    local m = class("/Script/Engine.Default__KismetMathLibrary")
+    if not valid(m) then return nil, "KismetMathLibrary wasn't found" end
+    local ok, r = pcall(function()
+        local dt = lib:GetDateTime(pc, true)
+        return { m:GetYear(dt), m:GetDayOfYear(dt), m:GetTotalSeconds(m:GetTimeOfDay(dt)) }
+    end)
+    if not ok then return nil, "GetDateTime: " .. tostring(r) end
+    local year, day, seconds = r[1], r[2], r[3]
+    if type(year) ~= "number" or type(day) ~= "number" or type(seconds) ~= "number" or year < 1000 then
+        return nil, string.format("GetDateTime gave year %s, day %s, %s s", tostring(year), tostring(day),
+            tostring(seconds))
+    end
+    return C.day_seconds(year, day, seconds)
+end
+
+-- The same from the game's time of day written out (TimeOfDayBPLibrary GetLocalTimeOfDayAsString), to the second.
+local function day_from_text()
+    local lib = class("/Script/TimeOfDay.Default__TimeOfDayBPLibrary")
+    if not valid(lib) then return nil, "TimeOfDayBPLibrary wasn't found" end
+    local ok, s = pcall(function() return lib:GetLocalTimeOfDayAsString() end)
+    if not ok then return nil, "GetLocalTimeOfDayAsString: " .. tostring(s) end
+    local day = C.parse_date(text_of(s))
+    if not day then return nil, string.format("GetLocalTimeOfDayAsString gave %q", tostring(text_of(s))) end
+    return day
+end
+
+-- The game's time of day in seconds since the year 1, as its saves have it, and how it was read; nil and why if it
+-- can't be.
+local function read_day(pc)
+    local day, why = day_from_datetime(pc)
+    if day then return day, "GetDateTime" end
+    local day2, why2 = day_from_text()
+    if day2 then return day2, "GetLocalTimeOfDayAsString" end
+    return nil, why .. "; " .. why2
+end
+
+-- The time of day now: the game's time and the difference measured on getting aboard and every CLOCK_EVERY seconds
+-- after, so a look costs no calls in between. Notes when it jumps: back (a save loaded), on further than the wall
+-- clock has gone (a later one), on another drive, or the first time it's read (the mod just started, maybe on one).
+local function follow_clock(now)
+    local t = game_time()
+    if t == nil then return end
+    if saves.t ~= nil and t < saves.t - 1.0 then                     -- another drive
+        saves.world, saves.day, saves.day_at = true, nil, -math.huge
+    end
+    saves.t = t
+    local every = CLOCK_EVERY
+    if saves.day == nil then
+        every = saves.clock_failed and CLOCK_EVERY or 0
+    elseif now - saves.world_at < 15.0 then
+        every = 5.0              -- read again soon after getting aboard, in case the game sets it a moment after
+    end
+    if now - saves.day_at >= every then
+        saves.day_at = now
+        local day, why = read_day(state.pc)
+        if day then
+            if saves.world then
+                log("the game's time of day: %s (%s)", C.date_text(day), why)
+                saves.world_at = now
+            end
+            saves.day, saves.clock_failed = day - t, false
+        elseif not saves.clock_failed then
+            saves.clock_failed = true
+            log("can't read the game's time of day (%s): the comfort isn't kept with its saves", tostring(why))
+        end
+    end
+    state.judge.day = saves.day
+    if saves.day == nil then return end
+    local clock, last = t + saves.day, saves.clock
+    if saves.world or last == nil or clock < last - 1.0 or clock - last > now - saves.clock_at + JUMP_SECONDS then
+        saves.jump = saves.jump or { from = last }
+    end
+    saves.world = false
+    saves.clock, saves.clock_at = clock, now
+end
+
+-- ({path: {service, at}} of the save files there now, [those the game has written since the last look]).
+local function read_saves()
+    local found, written = {}, {}
+    for _, path in ipairs(SAVE_FILES) do
+        local service, at = C.read_header(path)
+        local old = saves.files[path]
+        if service then                  -- else being written, say: as it was until it reads
+            if saves.looked and (old == nil or old.service ~= service or old.at ~= at) then
+                written[#written + 1] = path
+            end
+            saves.files[path] = { service = service, at = at }
+        end
+        found[path] = saves.files[path]
+    end
+    saves.looked = true
+    return found, written
+end
+
+local function so_far()
+    local done = state.judge.done
+    if #done == 0 then return "no rides done" end
+    return string.format("%d ride%s done, comfort %.0f", #done, #done == 1 and "" or "s", J.score(done))
+end
+
+local function keep(path, service, at)
+    local ok, err = C.keep(path, { service = service, at = at, state = state.judge:state(),
+                                   station = state.stop and state.stop.station or nil,
+                                   kept = os.date("%Y-%m-%d %H:%M:%S") })
+    if ok then
+        saves.kept = saves.kept + 1
+        log("kept with the game's %s of %s at %s: %s", C.kind(path), service, C.clock_text(at), so_far())
+    elseif not saves.write_failed then
+        saves.write_failed = true
+        log("can't keep the comfort beside the game's %s: %s", C.kind(path), tostring(err))
+    end
+end
+
+-- Back to what was kept with a save that's been loaded: the rides done, the ride going on, and whether the train
+-- was standing at a station (leaving it ends the ride to it).
+local function restore(kept)
+    local judge = state.judge
+    judge:restore(kept.state)
+    judge.day = saves.day
+    if judge.service ~= nil then state.service = judge.service end
+    state.stop = kept.station and { station = true } or nil
+    state.info.score, state.info.panel = judge:live_score(), nil
+    saves.restores = saves.restores + 1
+end
+
+-- The time of day jumped to `clock`. If one of the saves was made just before, that's the one loaded: the comfort
+-- goes back to what was kept with it. Gone back with nothing kept for it, the rides from after it are dropped. What
+-- to log, or nil.
+local function resume(found, clock, jump)
+    local near = {}
+    for path, h in pairs(found) do
+        if clock - h.at >= -2.0 and clock - h.at <= RESUME_SECONDS then near[#near + 1] = { path = path, save = h } end
+    end
+    table.sort(near, function(a, b) return a.save.at > b.save.at end)
+    for _, n in ipairs(near) do
+        local kept = C.find(n.path, n.save.service, n.save.at)
+        if kept then
+            restore(kept)
+            return string.format("the game's %s of %s at %s loaded: back to %s", C.kind(n.path), n.save.service,
+                C.clock_text(n.save.at), so_far())
+        end
+    end
+    if jump.from ~= nil and clock < jump.from - 1.0 then
+        local gone = state.judge:rewind(clock)
+        saves.restores = saves.restores + 1
+        return string.format("the game went back to %s, nothing kept with a save there: %d ride%s from after it "
+            .. "dropped, %s", C.clock_text(clock), gone, gone == 1 and "" or "s", so_far())
+    end
+    if #near > 0 then
+        return string.format("on the game's %s of %s at %s, nothing kept with it", C.kind(near[1].path),
+            near[1].save.service, C.clock_text(near[1].save.at))
+    end
+    return nil
+end
+
+-- Once a look: keeps the comfort with a save the game has written, once the drive's at its time (or has gone, as
+-- after saving and quitting); and once the time of day has jumped, puts the comfort back to what was kept with the
+-- save it jumped to.
+local function keep_with_saves(now)
+    if not S.KeepWithSaves or #SAVE_FILES == 0 then return end
+    if state.aboard then follow_clock(now) end
+    if saves.jump == nil and now - saves.read_at < SAVE_EVERY then return end
+    saves.read_at = now
+    local found, written = read_saves()
+    for _, path in ipairs(written) do
+        local h = found[path]
+        saves.pending[path] = { service = h.service, at = h.at, seen = now }
+    end
+    if saves.jump ~= nil then
+        local jump = saves.jump
+        saves.jump = nil
+        local said = resume(found, saves.clock, jump)
+        if said then log("%s", said) end
+    end
+    local judge, clock = state.judge, saves.clock
+    for path, p in pairs(saves.pending) do
+        if clock == nil or clock - p.at < -2.0 or clock - p.at > COPY_SECONDS then
+            if now - p.seen > PENDING_SECONDS then        -- written as another save loaded, say
+                saves.pending[path] = nil
+            end
+        elseif not (judge.moved and judge.v < J.MOVING and now - p.seen < STOPPING_SECONDS) then
+            saves.pending[path] = nil                     -- (saved on arriving: once the stop is judged)
+            keep(path, p.service, p.at)
+        end
+    end
+end
+
+----------------------------------------------------------------------------------------------------
 -- Looking at the game once a second
 
 local function leave(why)
@@ -727,8 +968,7 @@ local function look_at_train(pc, now)
     return true
 end
 
-local function look(now)
-    state.looked_at = now
+local function look_around(now)
     local pc = player_controller(now)
     if not pc then return leave("no player") end
     if not look_at_train(pc, now) then return end
@@ -784,6 +1024,12 @@ local function look(now)
             end
         end
     end
+end
+
+local function look(now)
+    state.looked_at = now
+    look_around(now)
+    keep_with_saves(now)
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -954,6 +1200,28 @@ local function report()
         end
         log("  this ride: %s", #lost > 0 and table.concat(lost, ", ") or "nothing lost")
     end)
+    report_section("saves", function()
+        local day, how = nil, "no player"
+        if pc then day, how = read_day(pc) end
+        log("the game's time of day: %s; kept with saves %d times, put back %d times", day and
+            string.format("%s (%s)", C.date_text(day), how) or ("can't be read: " .. tostring(how)), saves.kept,
+            saves.restores)
+        local ok_t, raw = pcall(function()
+            return text_of(class("/Script/TimeOfDay.Default__TimeOfDayBPLibrary"):GetLocalTimeOfDayAsString())
+        end)
+        log("  its time of day written out: %s", ok_t and string.format("%q", tostring(raw))
+            or ("can't be read: " .. tostring(raw)))
+        if not S.KeepWithSaves then log("  not kept with saves (KeepWithSaves is off)") end
+        if #SAVE_FILES == 0 then log("  the game's save files aren't known") end
+        for _, path in ipairs(SAVE_FILES) do
+            local service, at = C.read_header(path)
+            local kept = C.kept(path)
+            log("  %s: %s; kept beside it: %s", path:match("[^/\\]+$"),
+                service and string.format("%s at %s", service, C.date_text(at)) or ("can't be read: " .. tostring(at)),
+                kept and string.format("%s at %s, %d rides done", tostring(kept.service), C.date_text(kept.at),
+                    #(kept.state.done or {})) or "nothing")
+        end
+    end)
     report_section("objective box", function()
         search_widgets(real_time(), "report")
         for _, rec in ipairs(widgets()) do
@@ -973,7 +1241,8 @@ local function report()
     end)
     report_section("game functions", function()
         for _, name in ipairs({ "GetCurrentLocalDrivableActor", "GetDrivenServiceName", "GetFormation",
-                                "GetPassengerCount", "IsConsistPlayerDriven", "GetSimulationNodeParameterAsBool" }) do
+                                "GetPassengerCount", "IsConsistPlayerDriven", "GetSimulationNodeParameterAsBool",
+                                "GetDateTime" }) do
             log("  %s", describe_function(name))
         end
     end)
@@ -1039,8 +1308,19 @@ end)
 pcall(NotifyOnNewObject, "/Script/Engine.PlayerController", function()
     state.pc_stale = true
     state.pc_looked = -math.huge
+    saves.world, saves.day, saves.day_at, saves.read_at = true, nil, -math.huge, -math.huge   -- another drive
 end)
 if not ok_notify then log("the game won't say when it makes its objective box: it'll be looked for instead") end
 
 state.loop = start_loop()
 log("loaded: %s = off / on, %s = report to UE4SS.log", S.ToggleKey, S.ReportKey)
+if S.KeepWithSaves then
+    local names = {}
+    for _, path in ipairs(SAVE_FILES) do names[#names + 1] = path:match("[^/\\]+$") end
+    if #names > 0 then
+        log("keeping the comfort beside the game's saves: %s", table.concat(names, ", "))
+    else
+        log("the game's save files aren't known (install the comfort HUD again once the game has saved): "
+            .. "the comfort isn't kept with them")
+    end
+end

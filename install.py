@@ -9,10 +9,12 @@ Installs the fly-by camera and comfort HUD mods into Train Sim World 7.
 
 The game is found through Steam; --game-dir points at its Binaries\\Win64 folder instead.
 UE4SS is set up so it opens no windows over the game (its log is ue4ss\\UE4SS.log) and doesn't
-reload mods on Ctrl+R.
+reload mods on Ctrl+R. The comfort HUD is told where the game's save files are, to keep the comfort
+beside them (it can't look through a folder from inside the game).
 """
 
 import argparse
+import glob
 import os
 import re
 import shutil
@@ -26,6 +28,10 @@ MODS = {"FlyByCamera": "Fly-by camera", "ComfortHUD": "Comfort HUD"}   # folder:
 GAME_WIN64 = os.path.join("steamapps", "common", "Train Sim World 7", "WindowsNoEditor",
                           "TS2Prototype", "Binaries", "Win64")
 GAME_EXE = "TrainSimWorld.exe"
+# The game's saves, in Documents: a folder for each Steam account, each with the game's own save and checkpoint.
+SAVE_GAMES = os.path.join("My Games", "TrainSimWorld7", "Saved", "SaveGames")
+SAVE_PATTERNS = ("TSWSaveGame_*.sav", "TSWCheckpointSaveGame_*.sav")
+SAVE_LIST = os.path.join("Scripts", "comfort_save_files.lua")   # in the installed comfort HUD
 
 # UE4SS-settings.ini changes: no console or GUI windows over the game, no hot reload on Ctrl+R.
 SETTINGS = {
@@ -162,6 +168,50 @@ def set_up_ue4ss(win64):
         edit_file(mods_txt, samples_off)
 
 
+def documents_folder():
+    """The user's Documents folder, wherever Windows has put it (OneDrive moves it)."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders") as k:
+            return os.path.expandvars(winreg.QueryValueEx(k, "Personal")[0])
+    except OSError:
+        return os.path.join(os.path.expanduser("~"), "Documents")
+
+
+def save_folder():
+    """The game's SaveGames folder, or None if it isn't there (the game not run yet)."""
+    folder = os.path.join(documents_folder(), SAVE_GAMES)
+    return folder if os.path.isdir(folder) else None
+
+
+def save_files(folder):
+    """The game's save files: its own save and its checkpoint for each Steam account that has played."""
+    found = []
+    for pattern in SAVE_PATTERNS:
+        found += glob.glob(os.path.join(folder, "*", pattern))
+    return sorted(found)
+
+
+def write_save_list(target, files):
+    """Tells the installed comfort HUD where the game's save files are (comfort_save_files.lua). Written in
+    Windows' own code page, which is what Lua's io.open takes a path in."""
+    usable = []
+    for path in files:
+        try:
+            path.encode("mbcs", errors="strict")
+            usable.append(path.replace("\\", "/"))
+        except UnicodeEncodeError:
+            print(f"  note: the comfort HUD can't open {path} (characters it can't take in its name)")
+    lines = ["-- Written by install.py: the game's save files, to keep the comfort beside. Install the comfort HUD",
+             "-- again if the game starts saving somewhere new (another Steam account or player name).",
+             "return {"]
+    lines += [f'    "{path}",' for path in usable]
+    lines.append("}")
+    with open(os.path.join(target, SAVE_LIST), "w", encoding="mbcs", errors="replace") as f:
+        f.write("\n".join(lines) + "\n")
+    return usable
+
+
 def install_mod(win64, mod):
     mods = os.path.join(ue4ss_dir(win64), "Mods")
     target = os.path.join(mods, mod)
@@ -172,6 +222,13 @@ def install_mod(win64, mod):
     if os.path.isfile(mods_txt):
         edit_file(mods_txt, lambda t: set_mod_line(t, mod, True))
     print(f"{MODS[mod]} installed into {target}")
+    if mod == "ComfortHUD":
+        folder = save_folder()
+        files = write_save_list(target, save_files(folder) if folder else [])
+        if files:
+            print(f"  the comfort is kept beside the game's saves: {', '.join(os.path.basename(f) for f in files)}")
+        else:
+            print("  no saves of the game's found yet: once it has saved, install again to keep the comfort with them")
 
 
 def uninstall_mod(win64, mod):

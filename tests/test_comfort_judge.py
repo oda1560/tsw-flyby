@@ -212,6 +212,47 @@ class OnItsOwn(unittest.TestCase):
         self.assertAlmostEqual(panel["cost"], 3.0, delta=0.2)
         self.assertAlmostEqual(panel["score"], 97.0, delta=0.2)
 
+    def ride(self, top=10.0, rate=0.5, station="A"):
+        """Speeds up to `top`, brakes to a stand at `rate` and leaves the station: a ride done."""
+        v = 0.0
+        while v < top:
+            self.t += 1 / 15
+            v += 0.5 / 15
+            self.j.feed(self.j, self.t, v, 0.5, 20, self.t)
+        while v > 0:
+            self.t += 1 / 15
+            v = max(0.0, v - rate / 15)
+            self.j.feed(self.j, self.t, v, -rate if v > 0 else 0.0, 20, self.t)
+        self.run_at(2, 0.0, 0.0)
+        return plain(self.j.new_leg(self.j, "1M56", station))
+
+    def test_rides_timed_by_the_day(self):
+        self.j.day = 63876798000.0                        # the time of day less the game time fed
+        ride = self.ride()
+        self.assertAlmostEqual(ride["at"], 63876798000.0 + self.t - 2.0, delta=0.2)
+
+    def test_kept_and_put_back(self):
+        self.ride(rate=0.5, station="A")
+        self.ride(rate=1.2, station="B")                  # a jolt
+        kept = self.j.state(self.j)
+        score = self.j.live_score(self.j)
+        self.ride(rate=1.2, station="C")
+        self.assertNotAlmostEqual(self.j.live_score(self.j), score)
+        self.j.restore(self.j, kept)
+        self.assertAlmostEqual(self.j.live_score(self.j), score)
+        self.assertEqual([r["station"] for r in plain(self.j.done)], ["A", "B"])
+        kept.done[1].mark = 0                             # what was kept is a copy, both ways
+        self.assertNotEqual(plain(self.j.done)[0]["mark"], 0)
+
+    def test_gone_back_drops_the_rides_after(self):
+        self.ride(station="A")
+        middle = self.t
+        self.ride(station="B")
+        self.ride(station="C")
+        self.assertEqual(self.j.rewind(self.j, middle + 1), 2)
+        self.assertEqual([r["station"] for r in plain(self.j.done)], ["A"])
+        self.assertEqual(self.j.rewind(self.j, middle - 100), 1)
+
     def test_a_hard_stop_is_a_jolt(self):
         self.run_at(1, 10, 0.0)
         v = 10.0

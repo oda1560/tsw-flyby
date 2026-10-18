@@ -1,8 +1,9 @@
 -- A stand-in for UE4SS and the game, so the comfort HUD can run outside TSW7: a passenger train of a few cars (each
 -- rail vehicle split in two as in TSW7, the model at the world's origin and the view that moves, the driver attached
 -- to the view), an AI train with passengers of its own, and the HUD's objective box (the minimal one, as on the
--- user's screen) that the game writes its objective into. Sim.run(seconds) plays frames at 60 a second; the train's
--- speed follows Sim.acc (m/s²) or a driving function Sim.drive(t, v) -> acceleration.
+-- user's screen) that the game writes its objective into, and the game's time of day. Sim.run(seconds) plays frames
+-- at 60 a second; the train's speed follows Sim.acc (m/s²) or a driving function Sim.drive(t, v) -> acceleration.
+-- Sim.new_world(day) is another drive loading, as loading a save does.
 
 local Sim = { logs = {}, frame_fns = {}, keys = {}, hooks = {}, notify = {}, next_address = 1000 }
 
@@ -105,17 +106,8 @@ local function tarray(list)
     end }
 end
 
-function Sim.setup(opts)
-    opts = opts or {}
-    Sim.calls = {}
-    Sim.logs, Sim.frame_fns, Sim.keys, Sim.hooks, Sim.notify = {}, {}, {}, {}, {}
-    Sim.time, Sim.wall = 0.0, 100.0          -- game time, and the wall clock (os.clock)
-    Sim.v, Sim.acc, Sim.drive = opts.speed or 0.0, 0.0, nil
-    Sim.searches, Sim.set_texts, Sim.pc_searches = {}, 0, 0
-    Sim.paused, Sim.count_breaks = false, false
-    Sim.blueprint_loaded = false
-    Sim.service = opts.service or "1M56"
-
+-- The game's objects for a drive: the train, the player in it, the HUD.
+local function build(opts)
     local level = "/Game/Routes/Route/Maps/Route.Route:PersistentLevel"
     local train, ai_train = {}, {}
     local function vehicle(name, consist)
@@ -199,6 +191,13 @@ function Sim.setup(opts)
     end
     Sim.player_trains = opts.player_trains   -- IsConsistPlayerDriven in the gameplay library
     Sim.gameplay = object("TS2GameplayFunctionLibrary", "/Script/TS2Prototype.Default__TS2GameplayFunctionLibrary")
+    -- the time of day, as the header bar's clock reads it: an FDateTime (UE4SS gives no fields of it to read)
+    Sim.gameplay.GetDateTime = function(self, ctx, is_local)
+        call("GetDateTime")
+        if Sim.no_clock then error("bad call") end
+        if ctx ~= pc or is_local ~= true then error("bad parameters") end
+        return { datetime = Sim.day0 + Sim.time }
+    end
     Sim.gameplay.IsConsistPlayerDriven = function(self, actor, out)
         call("IsConsistPlayerDriven")
         if type(out) ~= "table" then error("out parameter missing") end
@@ -215,6 +214,32 @@ function Sim.setup(opts)
         "/Engine/Transient.GameEngine_0:BP_TS2GameInstance_C_0.HUD_Widget_C_0.WidgetTree.HUDObjectiveWidget_Minimal_1")
     Sim.template = new_widget("HUDObjectiveWidget_Minimal_C",
         "/Game/Core/Assets/HUD/Widgets/HUD_Widget.HUD_Widget_C:WidgetTree.HUDObjectiveWidget_Minimal_1")
+end
+
+function Sim.setup(opts)
+    opts = opts or {}
+    Sim.opts = opts
+    Sim.calls = {}
+    Sim.logs, Sim.frame_fns, Sim.keys, Sim.hooks, Sim.notify = {}, {}, {}, {}, {}
+    Sim.time, Sim.wall = 0.0, 100.0          -- game time, and the wall clock (os.clock)
+    Sim.day0 = opts.day or 63876729600.0 + 19 * 3600   -- the time of day at game time 0: 5 March 2025, 19:00
+    Sim.v, Sim.acc, Sim.drive = opts.speed or 0.0, 0.0, nil
+    Sim.searches, Sim.set_texts, Sim.pc_searches = {}, 0, 0
+    Sim.paused, Sim.count_breaks, Sim.no_clock, Sim.datetime_empty = false, false, false, false
+    Sim.blueprint_loaded = false
+    Sim.service = opts.service or "1M56"
+    build(opts)
+end
+
+-- Another drive loading (a save, say): the old one's objects gone, new ones made, the game's time starting again
+-- from 0 at time of day `day`, the train standing. Sim.load_hud() then, as for the first.
+function Sim.new_world(day)
+    for _, o in ipairs({ pc, pawn, view, Sim.widget, Sim.template }) do o.valid = false end
+    for _, v in ipairs(Sim.train) do v.valid = false end
+    Sim.time, Sim.day0, Sim.v, Sim.acc, Sim.drive = 0.0, day, 0.0, 0.0, nil
+    Sim.blueprint_loaded = false
+    build(Sim.opts)
+    for _, fn in ipairs(Sim.notify["/Script/Engine.PlayerController"] or {}) do fn(pc) end
 end
 
 -- The game showing an objective, as its HUD does: SetObjective, then ShowObjective (Name and Description written).
@@ -311,13 +336,45 @@ function StaticFindObject(path)
         or path == "/Script/TS2Prototype.PhysicsFunctionLibrary:DoesSimulationNodeExist" then
         return object("Function", path)
     end
-    if Sim.player_trains then
-        if path == "/Script/TS2Prototype.Default__TS2GameplayFunctionLibrary" then return Sim.gameplay end
-        if path == "/Script/TS2Prototype.TS2GameplayFunctionLibrary:IsConsistPlayerDriven" then
-            return object("Function", path)
-        end
+    if path == "/Script/TS2Prototype.Default__TS2GameplayFunctionLibrary" then return Sim.gameplay end
+    if path == "/Script/TS2Prototype.TS2GameplayFunctionLibrary:GetDateTime" then return object("Function", path) end
+    if Sim.player_trains and path == "/Script/TS2Prototype.TS2GameplayFunctionLibrary:IsConsistPlayerDriven" then
+        return object("Function", path)
     end
+    if path == "/Script/Engine.Default__KismetMathLibrary" then return Sim.math end
+    if path == "/Script/TimeOfDay.Default__TimeOfDayBPLibrary" then return Sim.tod_lib end
     return invalid()
+end
+
+-- The engine's maths library, for what's in an FDateTime: the year, the day of the year, the time of day (an
+-- FTimespan) and its seconds. Worked out here from the Unix time, not as the mod does.
+local UNIX = 62135596800             -- seconds from the year 1 to 1970
+Sim.math = object("KismetMathLibrary", "/Script/Engine.Default__KismetMathLibrary")
+local function date_of(dt)
+    if type(dt) ~= "table" or dt.datetime == nil then error("not an FDateTime") end
+    if Sim.datetime_empty then                       -- UE4SS passing it on without what's in it: 0 ticks
+        return { year = 1, yday = 1, hour = 0, min = 0, sec = 0 }, 0
+    end
+    return os.date("!*t", math.floor(dt.datetime - UNIX)), dt.datetime % 1
+end
+-- The game's time of day written out, from the TimeOfDay plugin's library
+Sim.tod_lib = object("TimeOfDayBPLibrary", "/Script/TimeOfDay.Default__TimeOfDayBPLibrary")
+Sim.tod_lib.GetLocalTimeOfDayAsString = function()
+    call("GetLocalTimeOfDayAsString")
+    if Sim.no_clock then error("bad call") end
+    return os.date("!%Y.%m.%d-%H.%M.%S", math.floor(Sim.day0 + Sim.time - UNIX))
+end
+Sim.math.GetYear = function(self, dt) call("GetYear"); return date_of(dt).year end
+Sim.math.GetDayOfYear = function(self, dt) call("GetDayOfYear"); return date_of(dt).yday end
+Sim.math.GetTimeOfDay = function(self, dt)
+    call("GetTimeOfDay")
+    local d, frac = date_of(dt)
+    return { timespan = d.hour * 3600 + d.min * 60 + d.sec + frac }
+end
+Sim.math.GetTotalSeconds = function(self, ts)
+    call("GetTotalSeconds")
+    if type(ts) ~= "table" or ts.timespan == nil then error("not an FTimespan") end
+    return ts.timespan
 end
 
 package.preload["UEHelpers"] = function()

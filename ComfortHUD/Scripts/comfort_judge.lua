@@ -9,12 +9,15 @@
 -- the rides' marks weighted by the passengers aboard.
 --
 -- Left out from tsw-joystick for now: timing how quickly each train's brake eases off (this mod doesn't read the
--- brake handle, so the warning allows 3 s for every train) and keeping the comfort with the game's saves.
+-- brake handle, so the warning allows 3 s for every train).
 --
 --     local judge = J.new()
 --     local said = judge:feed(now, speed, acc, passengers, clock)   -- a reading; what happened, for the log
 --     judge:panel()        -- nil, or what to show: {phase = "ease" / "stopped" / "firm" / "harsh" / "lost", ...}
 --     judge:new_leg(service)   -- leaving a station: the ride to it is done
+--     judge.day = ...      -- the game's time of day less `clock`: rides are timed by the day, as the game's saves are
+--     judge:state()        -- what's been judged, to keep with a game save; judge:restore(state) once it's loaded
+--     judge:rewind(day)    -- the game went back to that time of day with nothing kept for it
 
 local J = {}
 
@@ -43,7 +46,8 @@ J.RATIO_SECONDS = 3.0           -- game time against the wall clock over this lo
 J.HELD_HARDER = 0.05            -- the brake handle this much further on after the train's own holding brake came on:
                                 -- what it brakes counts again
 
--- A ride from a station on `service` (nil: not known). `upto`: game seconds the train last moved on it.
+-- A ride from a station on `service` (nil: not known). `upto`: when the train last moved on it, by the day's clock
+-- (game seconds without it).
 local function new_leg(service)
     return { stop = nil, braking = nil, harsh = {}, firm = { brake = 0.0, power = 0.0 }, way = {},
              passengers = 0, judged = false, service = service, upto = nil }
@@ -106,7 +110,7 @@ end
 
 local function round1(x) return math.floor(x * 10 + 0.5) / 10 end
 
--- A ride as it's kept: {station, mark, passengers, smooth, lost = losses(), at = game seconds it arrived}.
+-- A ride as it's kept: {station, mark, passengers, smooth, lost = losses(), at = when it arrived (leg.upto)}.
 local function ride_of(leg, station)
     return { station = station, mark = round1(J.mark(leg)), passengers = leg.passengers, smooth = smooth(leg),
              lost = J.losses(leg), at = leg.upto }
@@ -148,6 +152,7 @@ function J.new(ease)
     self.service = nil            -- the service the rides below are of
     self.done = {}                -- rides done on it (ride_of)
     self.most = 0                 -- most passengers aboard on it
+    self.day = nil                -- the game's time of day less the clock fed (seconds), when known
     return self
 end
 
@@ -190,7 +195,7 @@ function Judge:feed(now, speed, acc, passengers, clock, brake, power, hold)
     along = -braking
     if self.coach and self.coach.phase == "stopped" and now > self.coach_until then self.coach = nil end
     if self.loss and now > self.loss_until then self.loss = nil end
-    if judged and clock ~= nil and (v >= J.STOPPED or self.moved) then self.leg.upto = clock end
+    if judged and clock ~= nil and (v >= J.STOPPED or self.moved) then self.leg.upto = clock + (self.day or 0) end
     self.v = v
     if v > J.MOVING then
         self.moved = true
@@ -406,6 +411,44 @@ function Judge:new_leg(service, station, first)
     self.harsh = nil                  -- a harsh moment going on carries on into the next ride uncounted ...
     self.harsh_time = 0.0             -- ... and what's left of it is firm there
     return ride
+end
+
+local function copy(v)
+    if type(v) ~= "table" then return v end
+    local out = {}
+    for k, x in pairs(v) do out[k] = copy(x) end
+    return out
+end
+
+-- What's been judged, to keep with a game save: {service, done, most, leg} (a copy).
+function Judge:state()
+    return copy({ service = self.service, done = self.done, most = self.most, leg = self.leg })
+end
+
+-- Back to what was kept with a game save (state()), that save having been loaded.
+function Judge:restore(state)
+    state = copy(state)
+    self:lost()
+    self.service, self.done, self.most = state.service, state.done or {}, state.most or 0
+    self.leg = new_leg()
+    for k, v in pairs(state.leg or {}) do self.leg[k] = v end
+end
+
+-- The game went back to `day` (its time of day) with nothing kept for it: the rides that arrived after it are
+-- dropped, and the ride going on starts afresh if the train moved on it after. How many were dropped.
+function Judge:rewind(day)
+    local kept = {}
+    for _, r in ipairs(self.done) do
+        if r.at == nil or r.at <= day + 1.0 then kept[#kept + 1] = r end
+    end
+    local gone = #self.done - #kept
+    self.done = kept
+    self:lost()
+    if self.leg.upto ~= nil and self.leg.upto > day + 1.0 then self.leg = new_leg(self.leg.service) end
+    local most = self.leg.passengers
+    for _, r in ipairs(kept) do most = math.max(most, r.passengers) end
+    self.most = most
+    return gone
 end
 
 return J

@@ -24,6 +24,8 @@ The rules and the comfort score are the same as tsw-joystick's passenger comfort
 
 Only passenger trains are judged, empty ones included. On freight trains and light engines the objective box stays as the game has it.
 
+The comfort so far goes with the game's saves. Each time the game saves, the mod writes the rides done and the ride going on to a `.comfort` file beside that save. That includes Save in the menu and the checkpoint the game makes on arriving at and leaving each stop. Load a save, or start the game again and continue, and the comfort goes back to what it was when that save was made. So a service saved one evening and finished the next keeps its comfort, and a stop you try again from a checkpoint counts once. If you go back to a save made while the mod wasn't running, the rides after it are dropped.
+
 | Key | What it does |
 | --- | --- |
 | = | Switch the comfort HUD off (the objective box goes back to the game's own) and on again |
@@ -37,7 +39,9 @@ The comfort HUD runs through UE4SS, like the fly-by camera: see [the fly-by came
 
 Close the game, then double-click **Install comfort HUD.bat**. It goes into `ue4ss\Mods\ComfortHUD` in the game's Win64 folder. `python install.py` installs both mods; `--mod ComfortHUD` installs just this one.
 
-**Uninstall comfort HUD.bat** takes it out again and leaves UE4SS and the fly-by camera.
+The installer also tells the comfort HUD where the game keeps its saves (`Documents\My Games\TrainSimWorld7\Saved\SaveGames`), because the mod can't look through a folder from inside the game. If you install before the game has ever saved, install again once it has.
+
+**Uninstall comfort HUD.bat** takes it out again and leaves UE4SS and the fly-by camera. The `.comfort` files stay beside your saves. The game doesn't use them, so delete them if you like.
 
 If you also run tsw-joystick, switch off its **Show passenger comfort** setting, or you'll get each warning twice.
 
@@ -48,12 +52,15 @@ The settings are in `ComfortHUD\Scripts\comfort_settings.lua`. Edit the copy her
 - **ShowPassengers, ShowComfort:** the "62 aboard" and "comfort 87" after the objective.
 - **Warnings:** the warnings in the objective's place. Set to `false` to keep the game's objective there all the time.
 - **PlainText:** writes " / " and "m/s2" instead of " · " and "m/s²", in case the game shows those characters oddly.
+- **KeepWithSaves:** keeps the comfort with the game's saves. Set to `false` to start every drive at 100.
 - **ToggleKey, ReportKey:** the keys.
 - **DebugLog:** a line in the log every 5 seconds while you drive.
 
 ## Framerate
 
 The mod draws nothing of its own. It changes the text in the game's own objective box, and only when the words change. Each frame it asks the game two things, the time and the train's velocity. Besides that it makes about six calls a second: whether you're still aboard, whether the box is shown, and the game's objective. While stopped it also counts the passengers every 5 s. Working out the comfort and the box's words is the mod's own arithmetic, with no calls into the game. There are no windows over the game and no requests to the game's web API, the two things most likely to have slowed the game down with tsw-joystick.
+
+For the saves, it reads the first 16 KB of the game's two save files once a second, which takes about 0.1 ms. It reads the game's time of day when you get aboard and every 30 s after, a few calls each time.
 
 Searching through all the game's objects takes milliseconds, so the mod only does that once, to find the player when a drive loads. Your train's cars come from the game's own list of your train, without a search. The F11 report does search, so the game may stutter for a moment when you press it.
 
@@ -66,12 +73,13 @@ To see what it costs, look at the `[Comfort]` lines every 5 seconds in `UE4SS.lo
 - **The train's own holding brake:** read from the train's simulation the way the game's own blueprints read it (`DirectBrakeControlPowered.BrakeHoldActive` and the like, as tsw-joystick reads them). From when it comes on as the train stops, braking harder than just before isn't counted, so a Class 350's stops aren't all jolts. It's only read while the train is coming to a stop or moving off.
 - **Stations:** a stop counts as a station when, as the train comes in or while it stands, the game moves the objective on or the passengers change. Leaving a station ends the ride to it. A stop at a signal doesn't end the ride: a jolt there counts towards the ride it's on.
 - **The objective box:** the mod writes into the game's own objective box, in both the full and the minimal HUD. When the game writes its own text there, for a new objective or a new time, the mod puts its text back straight away.
+- **Saves:** each save file starts with the service it was made on and the game's time of day then, ahead of the compressed rest. The mod reads those once a second to notice a new save. It keeps the comfort beside the save once the drive is at that time, and for a save made as the train comes in, once the stop has been judged. The `.comfort` file names the save it was kept with, so the next save the game writes over that file doesn't pick it up. The mod knows a save has been loaded from the game's time of day, read the way the header bar's clock reads it. When the time jumps back, or to just after a save was made, the comfort goes back to what was kept with that save.
 
 ## Differences from tsw-joystick
 
 - **Brake timing:** the ease-off warning allows 3 s for the brake to release on every train. tsw-joystick times each train's brake.
 - **Holding brakes:** recognised as in tsw-joystick, but not yet seen working in the game. If stops on a Class 350, 331, 333 or 380 all show as jolts however gently you stop, look for `the train's own holding brake` in the log.
-- **Saves:** the comfort so far is lost when you quit the game or load a save. tsw-joystick keeps it with the game's saves.
+- **Saves:** kept with the game's saves by tsw-joystick's rules, in a `.comfort` file beside each save rather than one list. Not yet seen working in the game.
 - **Without an objective:** in free roam, or whenever the game hides the objective box, nothing is shown.
 
 ## When something's wrong
@@ -82,8 +90,13 @@ Everything the mod does is written to `ue4ss\UE4SS.log` in the game's Win64 fold
 - **Getting into a train:** which train, how many passenger cars it found in it and how (the game's list of your train is the one expected), and whether the train has its own holding brake.
 - **Stops:** smooth or jolt and how hard, and the mark of each ride when you leave a station.
 - **Every 5 seconds while driving:** speed, acceleration, passengers, comfort, what the box is showing, and how long the mod's work took.
+- **Saves:**
+  - `keeping the comfort beside the game's saves` when the game starts.
+  - `the game's time of day` on getting aboard, and how it was read.
+  - `kept with the game's checkpoint` (or `save`) each time the game saves.
+  - `loaded: back to` when you load a save.
 
-Pressing **F11** adds a report: your train front to back and which vehicles carry passengers, the service's name as the game gives it, each passenger car and its count, the holding brake, the comfort so far, what the objective box says and how big it is, and the game functions the mod uses with their parameters.
+Pressing **F11** adds a report: your train front to back and which vehicles carry passengers, the service's name as the game gives it, each passenger car and its count, the holding brake, the comfort so far, the game's time of day, each save file with what's kept beside it, what the objective box says and how big it is, and the game functions the mod uses with their parameters.
 
 **Nothing changes in the objective box:**
 - Look for `[Comfort] loaded` in the log. If it's missing, UE4SS didn't load the mod.
@@ -95,6 +108,11 @@ Pressing **F11** adds a report: your train front to back and which vehicles carr
 - A line saying `can't count the passengers` means the count couldn't be read. Comfort is still judged then.
 
 **The line runs onto two lines:** the minimal HUD wraps its second line at about 40 characters. Turn off **ShowPassengers** or **ShowComfort**.
+
+**The comfort isn't kept with your saves:**
+- `the game's save files aren't known` means the installer found no saves. Install again now that the game has saved.
+- `can't read the game's time of day` means the mod can't tell when a save is loaded, and the reason follows. The report's saves section shows the time of day both ways the mod reads it.
+- If neither line is there, press **F11**. The report lists each save file with its service and time, and what's kept beside it.
 
 ## What's been seen in the game
 
@@ -113,11 +131,15 @@ It was built from the game's own files: the objective box's layout and logic (it
 - the warnings and how stops are judged, compared with tsw-joystick's if you have it
 - a Class 350's holding brake
 - the mod's work each frame since it was cut down
+- the game's time of day: whether the log says `(GetDateTime)` or `(GetLocalTimeOfDayAsString)`, and that it matches the header bar's clock
+- the comfort kept with a checkpoint and put back when you load it, and after starting the game again
 
 ## For working on it
 
 - `ComfortHUD\Scripts\main.lua`: the parts that talk to the game: finding the train, its passenger cars and the objective box, reading the speed, writing the text, the keys and the report.
 - `ComfortHUD\Scripts\comfort_judge.lua`: the comfort rules, ported line for line from tsw-joystick's `tsw_comfort.py` (`Judge`). No game objects in it.
 - `ComfortHUD\Scripts\hud_text.lua`: what the objective box says for each warning.
+- `ComfortHUD\Scripts\comfort_saves.lua`: reading the start of the game's save files and the `.comfort` files kept beside them. No game objects in it. The save files' layout was read from the game's own saves. The installer writes `comfort_save_files.lua`, the list of save files, into the installed copy.
+- `tests\test_comfort_saves.py`: reads save files made up by `tests\gvas.py`, and the game's own saves where they're on this PC.
 - `tests\test_comfort_judge.py`: runs the Lua rules and tsw-joystick's Python side by side on the drives logged there (a Class 150 on 1M56, a Class 350 stop on 2W09) and on made-up services, and checks they agree at every reading. It needs tsw-joystick in `C:\code\tsw-joystick`.
 - `tests\test_comfort_hud.py`: runs the whole mod against `tests\fake_comfort_game.lua`, a passenger train, an AI train and the minimal HUD's objective box. Run `python -m unittest discover tests`.

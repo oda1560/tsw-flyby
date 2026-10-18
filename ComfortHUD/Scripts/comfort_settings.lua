@@ -13,6 +13,10 @@ return {
                               -- went, firm / harsh braking or speeding up and what it cost
     PlainText = false,        -- " / " and "m/s2" instead of " · " and "m/s²", if the game shows those oddly
 
+    -- The comfort so far kept beside each of the game's saves (a .comfort file next to the .sav), and put back when
+    -- the save is loaded: a service saved one evening and finished the next keeps its comfort
+    KeepWithSaves = true,
+
     -- How the train's acceleration is worked out from its speed, read every frame
     AccelWindow = 0.3,        -- seconds of game time the change of speed is measured over
 

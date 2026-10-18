@@ -68,10 +68,12 @@ class Installing(unittest.TestCase):
             z.writestr("ue4ss/UE4SS-settings.ini", "[Debug]\nConsoleEnabled = 1\n[General]\nEnableHotReloadSystem = 1\n")
             z.writestr("ue4ss/Mods/mods.txt", MODS_TXT)
 
+    saves = None                    # the game's SaveGames folder, None: the game hasn't saved yet
+
     def install(self, *args):
         argv = ["install.py", "--game-dir", self.win64, *args]
         with mock.patch.object(sys, "argv", argv), mock.patch.object(install, "game_running", return_value=False), \
-                mock.patch("builtins.print"):
+                mock.patch.object(install, "save_folder", return_value=self.saves), mock.patch("builtins.print"):
             install.main()
 
     def read(self, *parts):
@@ -98,6 +100,25 @@ class Installing(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(self.win64, "ue4ss", "Mods", mod, "enabled.txt")))
         self.assertTrue(os.path.isfile(os.path.join(self.win64, "ue4ss", "Mods", "ComfortHUD", "Scripts",
                                                     "comfort_judge.lua")))
+
+    def test_the_comfort_hud_is_told_where_the_saves_are(self):
+        self.saves = tempfile.mkdtemp()
+        account = os.path.join(self.saves, "76561197994196168")
+        os.makedirs(account)
+        for name in ("TSWSaveGame_cb06.sav", "TSWCheckpointSaveGame_cb06.sav", "PP_cb06.sav", "dovetaillive.sav"):
+            open(os.path.join(account, name), "w").close()
+        self.install("--ue4ss", self.zip, "--mod", "ComfortHUD")
+        listed = self.read("ue4ss", "Mods", "ComfortHUD", "Scripts", "comfort_save_files.lua")
+        folder = account.replace("\\", "/")
+        self.assertIn(f'"{folder}/TSWSaveGame_cb06.sav",', listed)
+        self.assertIn(f'"{folder}/TSWCheckpointSaveGame_cb06.sav",', listed)
+        self.assertNotIn("PP_", listed)
+        self.assertNotIn("\\", listed)
+
+    def test_before_the_game_has_saved(self):
+        self.install("--ue4ss", self.zip, "--mod", "ComfortHUD")
+        listed = self.read("ue4ss", "Mods", "ComfortHUD", "Scripts", "comfort_save_files.lua")
+        self.assertTrue(listed.rstrip().endswith("return {\n}"), listed)
 
     def test_one_mod(self):
         self.install("--ue4ss", self.zip, "--mod", "ComfortHUD")
