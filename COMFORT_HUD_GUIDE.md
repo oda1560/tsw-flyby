@@ -79,7 +79,7 @@ To see what it costs, look at the `[Comfort]` lines every 5 seconds in `UE4SS.lo
 
 - **Brake timing:** the ease-off warning allows 3 s for the brake to release on every train. tsw-joystick times each train's brake.
 - **Holding brakes:** recognised as in tsw-joystick, but not yet seen working in the game. If stops on a Class 350, 331, 333 or 380 all show as jolts however gently you stop, look for `the train's own holding brake` in the log.
-- **Saves:** kept with the game's saves by tsw-joystick's rules, in a `.comfort` file beside each save rather than one list. Not yet seen working in the game.
+- **Saves:** kept with the game's saves by tsw-joystick's rules, in a `.comfort` file beside each save rather than one list.
 - **Without an objective:** in free roam, or whenever the game hides the objective box, nothing is shown.
 
 ## When something's wrong
@@ -124,6 +124,12 @@ It was built from the game's own files: the objective box's layout and logic (it
 - The game ran at about 30 fps. The mod's work averaged 0.1–0.3 ms a frame.
 - It couldn't tell which cars were yours, so it counted only the car you drove: 50 aboard, then 17–22 after the stop. The game functions had been called without the parameters they take. Since fixed: the cars now come from the game's list of your train, and the service's name and the holding brake are read with the right parameters. The work each frame was cut down too: the box's words are worked out without asking the game, and the hidden box (the full HUD's, under the minimal one) is left alone.
 
+**Saves, 2026-10-18 (Class 375 on 2T12):**
+- The comfort was kept beside both the game's save and its checkpoint.
+- After starting the game again and loading the save, the comfort came back as it was: 4 rides done at comfort 100, and 99 with the firm braking in the ride going on.
+- The time of day came from the game's written-out clock (`GetLocalTimeOfDayAsString`). The `GetDateTime` way didn't work, and the log doesn't say why.
+- Not about saves: on the Class 375 the mod couldn't call `GetFormation` (UE4SS called it a `TrivialObject`). It fell back to searching the world's passenger cars, which took 32 ms once on boarding, and found the train's 4 cars.
+
 **Still to see in the game:**
 - the passenger count for the whole train, against the game's own
 - the service's name: whether the game gives it back as the mod expects
@@ -131,8 +137,7 @@ It was built from the game's own files: the objective box's layout and logic (it
 - the warnings and how stops are judged, compared with tsw-joystick's if you have it
 - a Class 350's holding brake
 - the mod's work each frame since it was cut down
-- the game's time of day: whether the log says `(GetDateTime)` or `(GetLocalTimeOfDayAsString)`, and that it matches the header bar's clock
-- the comfort kept with a checkpoint and put back when you load it, and after starting the game again
+- loading a checkpoint without restarting the game, and going back to a save made without the mod
 
 ## For working on it
 
