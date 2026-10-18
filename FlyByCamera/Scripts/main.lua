@@ -1,11 +1,21 @@
 -- Fly-by camera for Train Sim World 7, as a UE4SS Lua mod.
 -- Press 7 and the view cuts to a camera standing beside the line ahead of your train. It turns to follow the
--- train as it goes by, then moves on ahead again. Press 7 again for a new spot straight away. Press 6, or one of
--- the game's own camera keys, to go back.
+-- train as it goes by, then moves on ahead again. Press 7 again for a new spot straight away.
+-- Press 4 for the view from a random passenger seat on your train, riding along with it: a passenger looking the way
+-- their seat faces, out of the nearest window, their head moving with the train (seat_head.lua); the mouse turns it
+-- too. 4 again for another seat.
+-- Press 6, or one of the game's own camera keys, to go back.
 -- You can keep driving while it's on. Everything it does is written to UE4SS.log, lines starting [FlyBy].
+--
+-- The seats are the game's own (SeatBaseComponent / SeatComponent, read from TrainSimWorld.exe's reflection tables):
+-- each is a group of seats on a vehicle's view actor (RVV_...), listed in its SeatRegions with each seat's
+-- LocalPosition, LocalRotation and CameraOffset; StandardSeatName and SeatRole say what kind of seat it is. Your
+-- train's vehicles are the game's list of them (RailVehicleComponent GetFormation), which holds the model actors
+-- (RVM_...) that the views are attached to.
 
 local UEHelpers = require("UEHelpers")
 local FM = require("flyby_math")
+local H = require("seat_head")
 local S = require("flyby_settings")
 
 local CM = 100
@@ -17,6 +27,32 @@ local LEAVE_WAIT = 0.3  -- after a camera key, how long to wait for the game to 
 local GIVE_UP = 4       -- the game taking the view this many times...
 local GIVE_UP_IN = 3.0  -- ...within this many seconds: stop fighting it
 local DEBUG_EVERY = 2.0 -- seconds between debug lines
+
+local MAX_SEAT_DISTANCE = 1000 * CM -- a seat further than this from your vehicle isn't where your train is
+local MAX_SEATS = 2000              -- seats looked at, at most
+local FRONT_TO_BACK = 2             -- EActorConnectionIterationMode::FrontToBack: GetFormation's whole train
+local SNAP, KEEP_WORLD = 2, 1       -- EAttachmentRule
+local MOVING = 0.5 * CM             -- cm/s: faster than this the seat view goes by the way the train moves
+local MIDDLE_SEAT = 20              -- cm: a seat this close to the middle of its car is nearer neither window
+local BACK_REACH = 45               -- cm traced forward and back from a seat's eyes to find its back...
+local BACK_HEIGHTS = { 10, 35 }     -- ...this far below the eyes (headrest, back)...
+local BACK_CLOSER = 10              -- ...which is the side hit this much closer than the other
+-- The game's seat classes: a SeatComponent is a seat or two (a cab's), a MultiSeatComponent a car's passenger seating
+local SEAT_CLASSES = { "SeatBaseComponent", "SeatComponent", "MultiSeatComponent" }
+-- The game's seat enums, in their order from 0
+local SEAT_NAMES = { [0] = "Engineer", "Driver", "Secondman", "UKFirstClass", "UKSecondClass", "UKThirdClass",
+    "UKStandardClass", "USFirstClass", "USBusinessClass", "USCoachClass", "GenericPassenger", "Generic", "Steps",
+    "Ladder", "InspectionHatch" }
+local SEAT_ROLES = { [0] = "None", "Engineer", "Conductor", "Passenger" }
+local SEAT_VERBS = { [0] = "SitIn", "SitOn", "StandOn", "ClimbUp", "ClimbDown", "GoUp", "GoDown", "LookThrough",
+    "Generic" }
+-- Engineer (0) is also what a seat whose name was never set reads as, so on its own it says nothing.
+local CREW_SEATS = { Driver = true, Secondman = true, Steps = true, Ladder = true, InspectionHatch = true }
+local PASSENGER_SEATS = { UKFirstClass = true, UKSecondClass = true, UKThirdClass = true, UKStandardClass = true,
+    USFirstClass = true, USBusinessClass = true, USCoachClass = true, GenericPassenger = true }
+-- The game's function libraries that might have IsConsistPlayerDriven
+local LIBRARIES = { "PhysicsFunctionLibrary", "TS2GameplayFunctionLibrary", "TS2BlueprintSupportLibrary",
+                    "TSWVehicleFunctionLibrary", "TS2VehicleControlLibrary", "DTGFunctionLibrary" }
 
 local function log(fmt, ...)
     print("[FlyBy] " .. string.format(fmt, ...) .. "\n")
@@ -60,8 +96,9 @@ local function game_time(pc)
 end
 
 local state = {
-    active = false, measuring = false,
+    active = false, mode = nil, measuring = false, showing = false, -- mode "flyby" or "seat"; showing: the view is ours
     pc = nil, train = nil, camera = nil, previous_view = nil,
+    seat = nil, attached = false,   -- the seat the camera is in, and whether it rides attached to it
     tracker = nil, loop = nil,
     started_at = 0, frames = 0, measure_from = nil,
     placed_at = 0, placed_dir = nil, next_side = 1, want_new_spot = nil, traces_broken = false,
@@ -232,6 +269,511 @@ local function place(pc, why)
 end
 
 ----------------------------------------------------------------------------------------------------
+-- The seats on your train
+
+local classes = {}
+local function class(path)
+    local c = classes[path]
+    if not valid(c) then
+        c = StaticFindObject(path)
+        classes[path] = c
+    end
+    return valid(c) and c or nil
+end
+
+-- Goes through a TArray the game gave (or a Lua table), calling fn(element).
+local function each_in(arr, fn)
+    local ok, for_each = pcall(function() return arr.ForEach end)
+    if ok and for_each then
+        arr:ForEach(function(_, elem) fn(elem:get()) end)
+    else
+        for _, v in ipairs(arr) do fn(v) end
+    end
+end
+
+-- Calls a game function whose last parameter is an out parameter: UE4SS gives that back in the table passed for it,
+-- or after the return value. (ok, return value, out value), or (false, error).
+local function call_out(obj, name, ...)
+    local out = {}
+    local args = table.pack(...)
+    args.n = args.n + 1
+    args[args.n] = out
+    local r = table.pack(pcall(function() return obj[name](obj, table.unpack(args, 1, args.n)) end))
+    if not r[1] then return false, r[2] end
+    local value = r[3]
+    if value == nil then
+        for _, v in pairs(out) do
+            value = v
+            break
+        end
+    end
+    return true, r[2], value
+end
+
+-- The class default object of the game's function library that has the static function `name`.
+local libraries = {}
+local function library_for(name)
+    local lib = libraries[name]
+    if lib ~= nil then return lib or nil end
+    for _, cls in ipairs(LIBRARIES) do
+        if valid(StaticFindObject("/Script/TS2Prototype." .. cls .. ":" .. name)) then
+            local cdo = StaticFindObject("/Script/TS2Prototype.Default__" .. cls)
+            if valid(cdo) then
+                libraries[name] = cdo
+                return cdo
+            end
+        end
+    end
+    libraries[name] = false
+    return nil
+end
+
+-- The rail vehicle you drive: its model actor (RVM_..., at the world's origin).
+local function find_drivable(pc)
+    local ok, d = pcall(function() return pc:GetCurrentLocalDrivableActor(pc:GetWorld()) end)
+    if ok and valid(d) then return d end
+    local rv = class("/Script/TS2Prototype.RailVehicle")
+    for _, a in ipairs(attach_chain(pc.Pawn)) do
+        if is_a(a, rv) then return a end
+    end
+    return nil
+end
+
+-- The vehicles of your train, front to back, from the game's GetFormation on the RailVehicleComponent of the one you
+-- drive (the actor itself has none). nil and why if it won't say.
+local function formation(drivable)
+    local comp, how = nil, nil
+    local ok, c = pcall(function() return drivable.RailVehiclePhysicsComponent end)
+    if ok and valid(c) then
+        comp, how = c, "its RailVehiclePhysicsComponent"
+    else
+        local cls = class("/Script/TS2Prototype.RailVehicleComponent")
+        local ok2, c2 = pcall(function() return drivable:GetComponentByClass(cls) end)
+        if cls and ok2 and valid(c2) then comp, how = c2, "its RailVehicleComponent" end
+    end
+    if not comp then return nil, short_name(drivable) .. " has no RailVehicleComponent" end
+    local ok3, arr = pcall(function() return comp:GetFormation(FRONT_TO_BACK) end)
+    if not ok3 or arr == nil then
+        return nil, string.format("GetFormation of %s: %s", how, ok3 and "it gave nothing" or tostring(arr))
+    end
+    local list = {}
+    local ok4, err = pcall(each_in, arr, function(v)
+        if valid(v) then list[#list + 1] = v end
+    end)
+    if not ok4 then return nil, string.format("GetFormation of %s: %s", how, tostring(err)) end
+    for _, v in ipairs(list) do
+        if same(v, drivable) then return list, "GetFormation of " .. how end
+    end
+    return nil, string.format("GetFormation of %s: its %d vehicles left out the one you drive", how, #list)
+end
+
+-- Your train: a function giving, for an actor, its place in the train front to back (true when the place isn't
+-- known), or nil when it isn't one of your train's vehicles; how many vehicles (nil if not known); how that was found.
+local function my_train(pc, follow)
+    local drivable = find_drivable(pc)
+    if not drivable then
+        return function(a) return same(a, follow) or nil end, 1,
+            "only the vehicle you're in: the game doesn't say which one you drive"
+    end
+    local list, how = formation(drivable)
+    if list then
+        local at = {}
+        for i, v in ipairs(list) do at[v:GetAddress()] = i end
+        return function(a) return at[a:GetAddress()] end, #list, how
+    end
+    local lib = library_for("IsConsistPlayerDriven")
+    if lib then
+        local ok, yes = call_out(lib, "IsConsistPlayerDriven", drivable)
+        if ok and yes == true then
+            return function(a)
+                local ok2, y = call_out(lib, "IsConsistPlayerDriven", a)
+                return (ok2 and y == true) or nil
+            end, nil, "the game saying which vehicles are the player's (" .. how .. ")"
+        end
+    end
+    return function(a) return (same(a, drivable) or same(a, follow)) or nil end, 1,
+        "only the vehicle you drive (" .. how .. ")"
+end
+
+-- A game FVector / FRotator as a Lua table, or nil if it isn't one.
+local function vec_of(v)
+    local ok, r = pcall(function() return FM.vec(v.X, v.Y, v.Z) end)
+    if ok and type(r.X) == "number" and type(r.Y) == "number" and type(r.Z) == "number" then return r end
+    return nil
+end
+local function rot_of(v)
+    local ok, r = pcall(function() return { Pitch = v.Pitch, Yaw = v.Yaw, Roll = v.Roll } end)
+    if ok and type(r.Pitch) == "number" and type(r.Yaw) == "number" and type(r.Roll) == "number" then return r end
+    return nil
+end
+local function field(o, name)
+    local ok, v = pcall(function() return o[name] end)
+    if ok then return v end
+    return nil
+end
+
+-- An FText / FString / FName the game gave, as a Lua string; nil if it isn't one.
+local function text_of(v)
+    if type(v) == "string" then return v end
+    local ok, s = pcall(function() return v:ToString() end)
+    if ok and type(s) == "string" then return s end
+    return nil
+end
+
+-- The seats of a seat component: { index (the game's, from 0), pos, rot, offset, pos_from } in its own frame. The
+-- position is the game's GetSeatRegionLocalPosition where it gives one, else the seat's LocalPosition.
+local function regions_of(comp, room)
+    local list = {}
+    local arr = field(comp, "SeatRegions")
+    if arr ~= nil then
+        pcall(each_in, arr, function(r)
+            if #list >= room then return end
+            list[#list + 1] = { index = #list, pos = vec_of(field(r, "LocalPosition")),
+                rot = rot_of(field(r, "LocalRotation")), offset = vec_of(field(r, "CameraOffset")),
+                pos_from = "LocalPosition" }
+        end)
+    end
+    if #list == 0 then
+        local ok, n = pcall(function() return comp:GetSeatRegionCount() end)
+        if ok and type(n) == "number" then
+            for i = 0, math.min(n, room) - 1 do list[#list + 1] = { index = i } end
+        end
+    end
+    local kept = {}
+    for _, r in ipairs(list) do
+        local ok, p = pcall(function() return vec_of(comp:GetSeatRegionLocalPosition(r.index)) end)
+        if ok and p then r.field_pos, r.pos, r.pos_from = r.pos, p, "GetSeatRegionLocalPosition" end
+        if r.pos then
+            r.rot = r.rot or { Pitch = 0, Yaw = 0, Roll = 0 }
+            kept[#kept + 1] = r
+        end
+    end
+    return kept
+end
+
+-- What a seat component's seats are: "passenger", "crew" (a cab seat, steps, a ladder) or "maybe" when it doesn't
+-- say; and their type as the game has it, "name/role". The role goes first: it's the one a seat left with the
+-- default name still has set.
+local function seat_kind(comp)
+    local name = SEAT_NAMES[field(comp, "StandardSeatName")]
+    local role = SEAT_ROLES[field(comp, "SeatRole")]
+    local multi = is_a(comp, class("/Script/TS2Prototype.MultiSeatComponent"))
+    local label = (name or "?") .. "/" .. (role or "?") .. (multi and " multi-seat" or "")
+    if role == "Passenger" then return "passenger", label end
+    if role == "Engineer" or role == "Conductor" or CREW_SEATS[name] then return "crew", label end
+    if multi or PASSENGER_SEATS[name] then return "passenger", label end
+    return "maybe", label
+end
+
+-- Your vehicle's place in the train, for the actor a seat is on or what it's attached to.
+local function place_in(train, actor)
+    local place = train(actor)
+    if place then return place end
+    for _, a in ipairs(attach_chain(actor)) do
+        place = train(a)
+        if place then return place end
+    end
+    return nil
+end
+
+-- The seat groups on your train's vehicles: the views in the world that are attached to one of them (a view hangs
+-- off its vehicle's model actor, which is what the game's list of the train has), and the seat groups on those.
+local function groups_on_train(train)
+    local groups = {}
+    for _, view in ipairs(FindAllOf("RailVehicleView") or {}) do
+        if valid(view) and place_in(train, view) then
+            for _, cname in ipairs(SEAT_CLASSES) do
+                local cls = class("/Script/TS2Prototype." .. cname)
+                local ok, arr = pcall(function() return view:K2_GetComponentsByClass(cls) end)
+                if cls and ok and arr ~= nil then
+                    pcall(each_in, arr, function(c)
+                        if valid(c) then groups[#groups + 1] = c end
+                    end)
+                end
+            end
+        end
+    end
+    return groups
+end
+
+-- Every seat group in the world: a search through all the game's objects.
+local function all_groups()
+    local groups = {}
+    for _, cname in ipairs(SEAT_CLASSES) do
+        for _, c in ipairs(FindAllOf(cname) or {}) do groups[#groups + 1] = c end
+    end
+    return groups
+end
+
+-- The seats of those groups that are on your train and near `here`, by kind ("passenger", "maybe"); what was found
+-- of the groups; and the groups on your train, each { comp, owner, kind, label, place, regions }.
+local function seats_in(groups, train, here)
+    local found = { passenger = {}, maybe = {} }
+    local seen, count = {}, { total = 0, passenger = 0, maybe = 0, crew = 0, other = 0, far = 0, unread = 0 }
+    local on_train = {}
+    for _, comp in ipairs(groups) do
+        local addr = valid(comp) and comp:GetAddress()
+        if addr and not seen[addr] then
+            seen[addr] = true
+            count.total = count.total + 1
+            local ok, p = pcall(function() return as_vec(comp:K2_GetComponentLocation()) end)
+            local near = ok and FM.len(FM.sub(p, here)) <= MAX_SEAT_DISTANCE
+            local ok2, owner = pcall(function() return comp:GetOwner() end)
+            local place = near and ok2 and valid(owner) and place_in(train, owner)
+            if not near then
+                count.far = count.far + 1
+            elseif not place then
+                count.other = count.other + 1
+            else
+                local kind, label = seat_kind(comp)
+                local regions = regions_of(comp, MAX_SEATS - #found.passenger - #found.maybe)
+                on_train[#on_train + 1] = { comp = comp, owner = owner, kind = kind, label = label,
+                    place = type(place) == "number" and place or nil, regions = regions }
+                count[kind] = count[kind] + 1
+                if found[kind] then
+                    if #regions == 0 then count.unread = count.unread + 1 end
+                    for _, r in ipairs(regions) do
+                        r.key, r.comp, r.vehicle, r.name = addr .. ":" .. r.index, comp, owner, label
+                        r.place = type(place) == "number" and place or nil
+                        table.insert(found[kind], r)
+                    end
+                end
+            end
+        end
+    end
+    return found, count, on_train
+end
+
+-- "Engineer/Passenger 11, Driver/Engineer 2": the seat groups on your train by type, most first.
+local function seat_types(on_train)
+    local n, labels = {}, {}
+    for _, g in ipairs(on_train) do
+        if not n[g.label] then labels[#labels + 1] = g.label end
+        n[g.label] = (n[g.label] or 0) + 1
+    end
+    table.sort(labels, function(a, b) return n[a] > n[b] or (n[a] == n[b] and a < b) end)
+    local parts = {}
+    for _, l in ipairs(labels) do parts[#parts + 1] = l .. " " .. n[l] end
+    return #parts > 0 and table.concat(parts, ", ") or "none"
+end
+
+-- The passenger seats on your train, each { key, comp, index, pos, rot, offset, vehicle, place, name }; what they
+-- are ("passenger", or "unmarked" when no seat on the train says), how many vehicles the train has (nil if not known),
+-- how they were found, and the seat groups on your train (see seats_in). nil and why when there are none. Made on a
+-- key press, not every frame: it looks through the train's vehicles and, if it finds no seats there, every seat in
+-- the world.
+local function find_seats(pc)
+    local started = os.clock()
+    local follow, why = find_train(pc)
+    if not follow then return nil, why end
+    local here = location(follow)
+    local train, vehicles, how = my_train(pc, follow)
+    local where_from = "on your train's vehicles"
+    local found, count, on_train = seats_in(groups_on_train(train), train, here)
+    if #found.passenger + #found.maybe == 0 then
+        where_from = "in the world"
+        found, count, on_train = seats_in(all_groups(), train, here)
+    end
+    local kind = #found.passenger > 0 and "passenger" or "maybe"
+    local summary = string.format("%d seat group%s %s: %d passenger, %d unmarked and %d crew on your train%s "
+        .. "(by name/role: %s), %d on other trains, %d away from your train; your train from %s; looked in %.0f ms",
+        count.total, count.total == 1 and "" or "s", where_from, count.passenger, count.maybe, count.crew,
+        count.unread > 0 and string.format(", %d with no seats the mod could read", count.unread) or "",
+        seat_types(on_train), count.other, count.far, how, (os.clock() - started) * 1000)
+    if #found[kind] == 0 then return nil, summary, nil, nil, on_train end
+    return found[kind], kind == "passenger" and "passenger" or "unmarked", vehicles, summary, on_train
+end
+
+-- Whether one of the game's passengers sits in the seat; nil if the game won't say.
+local function taken(seat)
+    local ok, m = pcall(function() return seat.comp:GetPassengerModelInSeatRegion(seat.index) end)
+    if not ok then return nil end
+    return valid(m)
+end
+
+-- A random seat other than the one with `current` as its key, one with nobody in it if there is one.
+local function pick_seat(seats, current)
+    local choices = {}
+    for _, s in ipairs(seats) do
+        if s.key ~= current then choices[#choices + 1] = s end
+    end
+    if #choices == 0 then return seats[1] end
+    for i = #choices, 2, -1 do
+        local j = math.random(i)
+        choices[i], choices[j] = choices[j], choices[i]
+    end
+    for _, s in ipairs(choices) do
+        if taken(s) ~= true then return s end
+    end
+    return choices[1]
+end
+
+local function none_name()
+    if NAME_None ~= nil then return NAME_None end
+    if FName then
+        local ok, n = pcall(FName, "None")
+        if ok and n ~= nil then return n end
+    end
+    return "None"
+end
+
+local function yaw_of(v) return math.deg(math.atan(v.Y, v.X)) end
+
+-- The seat group's rotation now, and the way along its vehicle (its X axis, flat).
+local function group_frame(seat)
+    local turned = rot_of(seat.comp:K2_GetComponentRotation())
+    return turned, FM.flat_dir(FM.turn(turned, FM.vec(1, 0, 0))) or FM.vec(1, 0, 0)
+end
+
+-- Where the seat's eyes are in the world now.
+local function eye_point(seat, turned)
+    return FM.add(as_vec(seat.comp:K2_GetComponentLocation()), FM.turn(turned, seat.eye))
+end
+
+-- Which way along its vehicle a seat faces, in its group's frame, and how that was told: away from its back, found
+-- by tracing a short way forward and back from the eyes at the heights of the headrest and the back; or, when that
+-- tells nothing, whichever axis of the seat's own rotation runs along the vehicle (Unreal's characters face their Y
+-- axis, which is how the Class 331's seats turned out).
+local function seat_facing(pc, seat)
+    local turned, along = group_frame(seat)
+    if not state.traces_broken then
+        local eye, near = eye_point(seat, turned), {}
+        for _, way in ipairs({ 1, -1 }) do
+            near[way] = math.huge
+            for _, drop in ipairs(BACK_HEIGHTS) do
+                local from = FM.add(eye, FM.vec(0, 0, -drop))
+                local ok, hit = pcall(trace, pc, from, FM.add(from, FM.scale(along, way * BACK_REACH)))
+                if ok and hit then near[way] = math.min(near[way], FM.len(FM.sub(hit, from))) end
+            end
+        end
+        for _, way in ipairs({ 1, -1 }) do
+            if near[way] + BACK_CLOSER < near[-way] then
+                return FM.vec(-way, 0, 0), string.format("its back %.0f cm behind", near[way])
+            end
+        end
+    end
+    local x, y = FM.axes(seat.rot)
+    local axis = math.abs(x.X) >= math.abs(y.X) and x or y
+    return FM.flat_dir(FM.vec(axis.X, 0, 0)) or FM.vec(1, 0, 0), "guessed from the seat's rotation"
+end
+
+-- The way the train is going, flat, and its speed: the seat's vehicle's velocity while it moves, the way it last
+-- went while it stands, or, before it has moved, towards the driver at the front.
+local function travel_of(seat, along)
+    local ok, v = pcall(function() return as_vec(seat.vehicle:GetVelocity()) end)
+    local speed = ok and FM.len2(v) or 0
+    if speed > MOVING then state.travel = FM.flat_dir(v) end
+    if not state.travel then
+        local okp, driver = pcall(function() return location(state.pc.Pawn) end)
+        local okc, eye = pcall(function() return location(state.camera) end)
+        local back = okp and okc and FM.dot2(FM.sub(driver, eye), along) < 0
+        state.travel = FM.scale(along, back and -1 or 1)
+    end
+    return state.travel, speed
+end
+
+-- The mouse's movement this frame, as the game has it; 0, 0 while its cursor is showing or the seat view's mouse is
+-- off.
+local function first_number(t)
+    if type(t) ~= "table" then return nil end
+    for _, v in pairs(t) do
+        if type(v) == "number" then return v end
+    end
+    return nil
+end
+
+local function mouse_delta(pc)
+    if not S.SeatMouse or state.mouse_broken then return 0, 0 end
+    local okc, shown = pcall(function() return pc.bShowMouseCursor end)
+    if okc and shown == true then return 0, 0 end
+    local out_x, out_y = {}, {}
+    local ok, a, b = pcall(function() return pc:GetInputMouseDelta(out_x, out_y) end)
+    if not ok then
+        state.mouse_broken = true
+        log("can't read the mouse (%s): turning the seat view with it is off", tostring(a))
+        return 0, 0
+    end
+    local dx = type(a) == "number" and a or first_number(out_x) or 0
+    local dy = type(b) == "number" and b or first_number(out_y) or 0
+    if (dx ~= 0 or dy ~= 0) and not state.mouse_seen then
+        state.mouse_seen = true
+        log("the mouse turns the seat view (GetInputMouseDelta gave %.2f %.2f)", dx, dy)
+    end
+    return dx, dy
+end
+
+-- Points the passenger's head (seat_head.lua) and puts the camera there: at the seat's eyes, moved a little as the
+-- head moves, looking where they look.
+local function look(seat, t, first)
+    local cam = state.camera
+    local turned, along = group_frame(seat)
+    local travel, speed = travel_of(seat, along)
+    local facing = FM.turn(turned, seat.facing)
+    local side = 0                    -- the nearest window, as they sit: on their right (1) or left (-1)
+    if math.abs(seat.lateral) >= MIDDLE_SEAT then
+        side = ((seat.lateral > 0) == (FM.dot2(facing, along) >= 0)) and 1 or -1
+    end
+    local dx, dy = mouse_delta(state.pc)
+    local rot, moved = H.step(state.head, { t = t, dt = first and 0 or t - state.look_at, travel = yaw_of(travel),
+        speed = speed, side = side, facing = yaw_of(facing), mouse_dx = dx, mouse_dy = dy }, S)
+    state.look_at, state.side, state.speed = t, side, speed
+    local offset = FM.add(FM.add(FM.scale(travel, moved.fwd), FM.scale(FM.right_of(travel), moved.right)),
+        FM.vec(0, 0, moved.up))
+    if state.attached then
+        cam:K2_SetActorRelativeLocation(FM.add(seat.eye, FM.unturn(turned, offset)), false, {}, true)
+        cam:K2_SetActorRotation(rot, false)
+    else
+        local pos = FM.add(eye_point(seat, turned), offset)
+        if not cam:K2_TeleportTo(pos, rot) then
+            cam:K2_SetActorLocation(pos, false, {}, true)
+            cam:K2_SetActorRotation(rot, false)
+        end
+    end
+end
+
+local function window_side(side)
+    return side > 0 and "the window on their right" or side < 0 and "the window on their left"
+        or "neither window nearer"
+end
+
+-- Puts the camera at the seat's eyes, attached to the seat's component so it rides along with the train (or, if the
+-- game won't attach it, moved there each frame), with a passenger's head looking out of it.
+local function sit(seat, vehicles)
+    local cam, pc = state.camera, state.pc
+    local t = game_time(pc)
+    seat.eye = FM.seat_eye(seat.pos, seat.rot, seat.offset, S.SeatEyeHeight * CM)
+    local ok, err = pcall(function()
+        cam:K2_AttachToComponent(seat.comp, none_name(), SNAP, SNAP, KEEP_WORLD, false)
+        cam:K2_SetActorRelativeLocation(seat.eye, false, {}, true)
+        cam:K2_SetActorRelativeRotation(seat.rot, false, {}, true)
+    end)
+    local okp, parent = pcall(function() return cam:GetAttachParentActor() end)
+    state.attached = ok and okp and same(parent, seat.vehicle)
+    if not state.attached then
+        pcall(function() cam:K2_DetachFromActor(KEEP_WORLD, KEEP_WORLD, KEEP_WORLD) end)
+    end
+    local turned, along = group_frame(seat)
+    local how_facing
+    seat.facing, how_facing = seat_facing(pc, seat)
+    local okv, middle = pcall(function() return location(seat.vehicle) end)
+    seat.lateral = okv and FM.dot2(FM.sub(eye_point(seat, turned), middle), FM.right_of(along)) or 0
+    state.seat, state.head = seat, H.new(math.random, t)
+    look(seat, t, true)
+    local travel = state.travel
+    local backwards = FM.dot2(FM.turn(turned, seat.facing), travel) < 0
+    local eyes = seat.offset and FM.len(seat.offset) > 0.5
+        and string.format("the seat's camera offset %s", where(seat.offset))
+        or string.format("%.2f m above the seat", S.SeatEyeHeight)
+    log("in seat %d of %s, a %s group in %s (%sat %s in its group, from %s), eyes %s; it faces %s (%s), %s, "
+        .. "%.0f cm from the middle of the car%s", seat.index, short_name(seat.comp), seat.name,
+        short_name(seat.vehicle), seat.place and vehicles and string.format("vehicle %d of %d, ", seat.place, vehicles)
+        or "", where(seat.pos), seat.pos_from, eyes, backwards and "backwards" or "the way of travel", how_facing,
+        window_side(state.side), seat.lateral, state.attached and "" or string.format(
+            "; the game wouldn't attach the camera (%s), moving it there each frame",
+            ok and "it stayed loose" or tostring(err)))
+end
+
+----------------------------------------------------------------------------------------------------
 -- Running it
 
 local stop -- defined below; the frame needs it
@@ -244,8 +786,16 @@ local function cut_to_camera(pc, t)
     log("timed the train at %.1f m/s over %.2f s (the game's own velocity says %s)", state.tracker.speed / CM,
         elapsed, vok and string.format("%.1f m/s", FM.len2(vel) / CM) or "nothing")
     state.measuring = false
+    if state.seat then -- coming from the seat view: let go of the seat
+        if state.attached then
+            pcall(function() state.camera:K2_DetachFromActor(KEEP_WORLD, KEEP_WORLD, KEEP_WORLD) end)
+        end
+        state.seat, state.attached = nil, false
+    end
+    pcall(function() state.camera.CameraComponent:SetFieldOfView(S.Fov) end)
     place(pc, "switched on")
     pc:SetViewTargetWithBlend(state.camera, 0.0, 0, 0.0, false)
+    state.showing = true
     state.started_at = t
     state.debug_at, state.debug_from = t, location(state.train)
 end
@@ -280,7 +830,22 @@ local function debug_line(t, train_pos, cam_pos)
     state.debug_at, state.debug_from = t, train_pos
 end
 
-local function frame()
+-- Keeps the view on the camera, or hands it over: false once it's off.
+local function hold_view(pc, cam, t)
+    local viewing = pc:GetViewTarget()
+    if not same(viewing, cam) then
+        game_took_view(pc, cam, viewing, t)
+        if not state.active then return false end
+    end
+    state.game_switched = false
+    if state.leave_at and t >= state.leave_at then
+        stop("you pressed a camera key", false)
+        return false
+    end
+    return true
+end
+
+local function flyby_frame()
     local pc, cam, train = state.pc, state.camera, state.train
     if not (valid(pc) and valid(cam) and valid(train)) then
         return stop("the train or the camera has gone (another train, or back to the menu?)", true)
@@ -293,19 +858,12 @@ local function frame()
 
     if state.measuring then
         state.frames = state.frames + 1
+        if state.seat and valid(state.seat.comp) then look(state.seat, t) end
         if t - state.measure_from.t >= MEASURE or state.frames >= MEASURE_FRAMES then cut_to_camera(pc, t) end
         return
     end
 
-    local viewing = pc:GetViewTarget()
-    if not same(viewing, cam) then
-        game_took_view(pc, cam, viewing, t)
-        if not state.active then return end
-    end
-    state.game_switched = false
-    if state.leave_at and t >= state.leave_at then
-        return stop("you pressed a camera key", false)
-    end
+    if not hold_view(pc, cam, t) then return end
 
     local cam_pos = location(cam)
     if t - state.placed_at >= MIN_GAP then
@@ -326,9 +884,33 @@ local function frame()
     debug_line(t, train_pos, cam_pos)
 end
 
+local function seat_frame()
+    local pc, cam = state.pc, state.camera
+    if not (valid(pc) and valid(cam)) then
+        return stop("the camera has gone (another train, or back to the menu?)", true)
+    end
+    local t = game_time(pc)
+    if not valid(state.seat.comp) then
+        local seats, kind_or_why, vehicles, how = find_seats(pc)
+        if not seats then return stop("the seat has gone, and there's no other: " .. kind_or_why, false) end
+        log("the seat has gone (its vehicle unloaded?): %d %s seats on your train now (%s)", #seats, kind_or_why,
+            how)
+        sit(pick_seat(seats, nil), vehicles)
+    end
+    if not hold_view(pc, cam, t) then return end
+    look(state.seat, t)
+    if S.DebugLog and t - state.debug_at >= DEBUG_EVERY then
+        local cam_pos, vehicle_pos = location(cam), location(state.seat.vehicle)
+        log("seat camera at %s, %.1f m from the middle of its vehicle, which is at %s; %.1f m/s, looking %+.0f "
+            .. "degrees from the way of travel, %s", where(cam_pos), FM.len(FM.sub(cam_pos, vehicle_pos))
+            / CM, where(vehicle_pos), state.speed / CM, H.looking(state.head), window_side(state.side))
+        state.debug_at = t
+    end
+end
+
 local function on_frame()
     if not state.active then return end
-    local ok, err = pcall(frame)
+    local ok, err = pcall(state.mode == "seat" and seat_frame or flyby_frame)
     if not ok then stop("something went wrong: " .. tostring(err)) end
 end
 
@@ -377,13 +959,14 @@ stop = function(why, game_has_view)
     stop_loop(state.loop)
     state.loop = nil
     local pc, cam = state.pc, state.camera
-    if not game_has_view and not state.measuring and valid(pc) then
+    if not game_has_view and state.showing and valid(pc) then
         local back = valid(state.previous_view) and state.previous_view or pc.Pawn
         if valid(back) then pcall(function() pc:SetViewTargetWithBlend(back, 0.0, 0, 0.0, false) end) end
     end
-    state.measuring = false
+    state.mode, state.measuring, state.showing = nil, false, false
     if valid(cam) then pcall(function() cam:K2_DestroyActor() end) end
     state.camera, state.train, state.previous_view, state.last_grab = nil, nil, nil, nil
+    state.seat, state.attached, state.head, state.travel = nil, false, nil, nil
     log("off: %s", why)
 end
 
@@ -407,39 +990,89 @@ local function describe_follow(train, how)
     return string.format("%s at %s (%s)", short_name(train), where(p), how)
 end
 
-local function start()
-    local pc = UEHelpers.GetPlayerController()
-    if not valid(pc) then return log("no player yet: load into a drive first") end
-    local train, how = find_train(pc)
-    if not train then return log("no train to follow: %s", how) end
-    local train_pos = location(train)
-    local cam = spawn_camera(pc, FM.add(train_pos, FM.vec(0, 0, 10 * CM)))
-    if not cam then return log("the game wouldn't create a camera") end
-    pcall(function() cam.CameraComponent.bConstrainAspectRatio = false end)
-    pcall(function() cam.CameraComponent:SetFieldOfView(S.Fov) end)
-    watch_game_camera_switches()
+-- The player, when there is one to take the view from.
+local function player()
+    local pc = state.active and state.pc or UEHelpers.GetPlayerController()
+    if valid(pc) then return pc end
+    log("no player yet: load into a drive first")
+    return nil
+end
 
-    local t = game_time(pc)
-    state.pc, state.train, state.camera = pc, train, cam
+-- A camera of the mod's own, at `at`, with the view as it was noted to go back to. false if there's none.
+local function new_camera(pc, at)
+    local cam = spawn_camera(pc, at)
+    if not cam then
+        log("the game wouldn't create a camera")
+        return false
+    end
+    pcall(function() cam.CameraComponent.bConstrainAspectRatio = false end)
+    watch_game_camera_switches()
+    state.pc, state.camera = pc, cam
     state.previous_view = pc:GetViewTarget()
-    state.use_heading = not same(train, pc.Pawn) -- the driver's heading is where they look, not the line
-    state.tracker = FM.new_tracker()
-    FM.track(state.tracker, train_pos, t, state.use_heading and forward_of(train) or nil)
-    state.next_side = S.Side == "left" and -1 or 1
-    state.want_new_spot, state.leave_at, state.camera_key_at = nil, nil, nil
+    state.showing, state.seat, state.attached = false, nil, false
+    state.leave_at, state.camera_key_at = nil, nil
     state.grabs, state.last_grab, state.game_switched = {}, nil, false
-    state.measuring, state.frames, state.measure_from = true, 0, { pos = train_pos, t = t }
-    state.started_at = t
+    state.debug_at = game_time(pc)
+    return true
+end
+
+local function run()
     state.active = true
-    log("on: following %s; view was %s", describe_follow(train, how), short_name(state.previous_view))
     local ok, err = pcall(function() state.loop = start_loop() end)
     if not ok then stop("couldn't switch on: " .. tostring(err)) end
 end
 
--- One of the game's camera keys: leave the fly-by for the game's camera.
+-- The fly-by camera: on, or from the seat view.
+local function start_flyby()
+    local pc = player()
+    if not pc then return end
+    local train, how = find_train(pc)
+    if not train then return log("no train to follow: %s", how) end
+    local train_pos = location(train)
+    local was_on = state.active
+    if not was_on and not new_camera(pc, FM.add(train_pos, FM.vec(0, 0, 10 * CM))) then return end
+
+    local t = game_time(pc)
+    state.mode, state.train = "flyby", train
+    state.use_heading = not same(train, pc.Pawn) -- the driver's heading is where they look, not the line
+    state.tracker = FM.new_tracker()
+    FM.track(state.tracker, train_pos, t, state.use_heading and forward_of(train) or nil)
+    state.next_side = S.Side == "left" and -1 or 1
+    state.want_new_spot = nil
+    state.measuring, state.frames, state.measure_from = true, 0, { pos = train_pos, t = t }
+    state.started_at = t
+    if was_on then return log("fly-by: following %s", describe_follow(train, how)) end
+    log("on: following %s; view was %s", describe_follow(train, how), short_name(state.previous_view))
+    run()
+end
+
+-- The seat view: on, from the fly-by, or another seat.
+local function seat_view()
+    local pc = player()
+    if not pc then return end
+    local seats, kind, vehicles, how = find_seats(pc)
+    if not seats then return log("no passenger seats on your train: %s", kind) end
+    local seat = pick_seat(seats, state.mode == "seat" and state.seat and state.seat.key or nil)
+    local was_on = state.active
+    if not was_on and not new_camera(pc, location(seat.vehicle)) then return end
+    if was_on and state.mode == "seat" then
+        log("another seat: %d %s seats on your train (%s)", #seats, kind, how)
+    else
+        log("%s: the view from a seat; %d %s seats on your train (%s)", was_on and "seat view" or "on", #seats, kind,
+            how)
+    end
+    state.mode, state.measuring, state.want_new_spot = "seat", false, nil
+    pcall(function() state.camera.CameraComponent:SetFieldOfView(S.SeatFov) end)
+    sit(seat, vehicles)
+    pc:SetViewTargetWithBlend(state.camera, 0.0, 0, 0.0, false)
+    state.showing = true
+    if not was_on then run() end
+end
+
+-- One of the game's camera keys: leave the fly-by or the seat for the game's camera.
 local function game_camera_key()
     if not state.active then return end
-    if state.measuring then return stop("you pressed a camera key", true) end
+    if not state.showing then return stop("you pressed a camera key", true) end
     local t = game_time(state.pc)
     state.camera_key_at = t
     if state.last_grab and t - state.last_grab.t <= KEY_WINDOW and valid(state.last_grab.target) then
@@ -499,8 +1132,8 @@ end
 local function report()
     log("---- report ----")
     report_section("versions", function()
-        log("Unreal %s.%s, engine tick hook %s, fly-by %s", UnrealVersion:GetMajor(), UnrealVersion:GetMinor(),
-            EngineTickAvailable and "yes" or "no", state.active and "on" or "off")
+        log("Unreal %s.%s, engine tick hook %s, camera %s", UnrealVersion:GetMajor(), UnrealVersion:GetMinor(),
+            EngineTickAvailable and "yes" or "no", state.mode == "seat" and "in a seat" or state.mode or "off")
     end)
     local pc = UEHelpers.GetPlayerController()
     log("player controller: %s", name_of(pc))
@@ -520,7 +1153,46 @@ local function report()
         local train, how = find_train(pc)
         log("would follow: %s", train and describe_follow(train, how) or how)
     end)
-    if state.active and not state.measuring then
+    report_section("seats", function()
+        local seats, kind, vehicles, how, groups = find_seats(pc)
+        if seats then
+            log("seats: %d %s seats on your train of %s vehicles (%s)", #seats, kind, tostring(vehicles or "?"), how)
+        else
+            log("seats: none on your train (%s)", kind)
+        end
+        for i, g in ipairs(groups or {}) do
+            if i > 20 then
+                log("  and %d more", #groups - 20)
+                break
+            end
+            local c = g.comp
+            local okw, at = pcall(function() return where(as_vec(c:K2_GetComponentLocation())) end)
+            local verb = field(c, "StandardSeatVerb")
+            log("  %s in %s%s at %s: %s, %s (name %s, role %s, verb %s, custom name %s), %d seats, camera Z "
+                .. "offset %s, passengers hidden within %s", short_name(c), short_name(g.owner),
+                g.place and string.format(" (vehicle %d)", g.place) or "", okw and at or "?", g.kind, g.label,
+                tostring(field(c, "StandardSeatName")), tostring(field(c, "SeatRole")),
+                (SEAT_VERBS[verb] or "?") .. " " .. tostring(verb), tostring(text_of(field(c, "CustomSeatName"))),
+                #g.regions, tostring(field(c, "HitTestCameraZOffset")),
+                tostring(field(c, "MinCameraDistanceToShowCharacter")))
+            local r = g.regions[1]
+            if r then
+                log("    seat %d: at %s (%s%s), turned %.0f %.0f %.0f, camera offset %s, someone in it: %s", r.index,
+                    where(r.pos), r.pos_from, r.field_pos and (", LocalPosition " .. where(r.field_pos)) or "",
+                    r.rot.Pitch, r.rot.Yaw, r.rot.Roll, r.offset and where(r.offset) or "none",
+                    tostring(taken({ comp = c, index = r.index })))
+            end
+        end
+    end)
+    if state.mode == "seat" and state.seat then
+        local okw, at = pcall(function() return where(location(state.camera)) end)
+        log("in seat %d of %s (%s) in %s, camera at %s, %s; looking %+.0f degrees from the way of travel, %s",
+            state.seat.index, short_name(state.seat.comp), state.seat.name, short_name(state.seat.vehicle),
+            okw and at or "?",
+            state.attached and "attached to the seat" or "moved there each frame", H.looking(state.head),
+            window_side(state.side))
+    end
+    if state.mode == "flyby" and not state.measuring then
         local tr = state.tracker
         log("tracking: %.1f m/s, curve radius %s, grade %.3f", tr.speed / CM,
             tr.curvature ~= 0 and string.format("%.0f m", 1 / math.abs(tr.curvature) / CM) or "straight", tr.grade)
@@ -568,11 +1240,14 @@ local function on_key(name, fn)
     if #mods > 0 then RegisterKeyBind(key, mods, run) else RegisterKeyBind(key, run) end
 end
 
--- Fly-by key: switch on, or once on, move to a new spot ahead.
+-- Fly-by key: switch on (or over from the seat view), or once on, move to a new spot ahead.
 on_key(S.FlyByKey, function()
-    if not state.active then return start() end
+    if state.mode ~= "flyby" then return start_flyby() end
     if not state.measuring then state.want_new_spot = "you asked for a new spot" end
 end)
+
+-- Seat key: the view from a random passenger seat on your train; pressed again, another seat.
+on_key(S.SeatKey, seat_view)
 
 on_key(S.OffKey, function()
     if state.active then stop("you switched it off") end
@@ -584,4 +1259,5 @@ for _, name in ipairs(S.GameCameraKeys or {}) do
     on_key(name, game_camera_key)
 end
 
-log("loaded: %s = fly-by camera / new spot, %s = off, %s = report to UE4SS.log", S.FlyByKey, S.OffKey, S.ReportKey)
+log("loaded: %s = fly-by camera / new spot, %s = seat view / another seat, %s = off, %s = report to UE4SS.log",
+    S.FlyByKey, S.SeatKey, S.OffKey, S.ReportKey)

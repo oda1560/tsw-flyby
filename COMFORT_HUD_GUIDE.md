@@ -31,7 +31,7 @@ The comfort so far goes with the game's saves. Each time the game saves, the mod
 | = | Switch the comfort HUD off (the objective box goes back to the game's own) and on again |
 | F11 | Write a report of what the mod can see into UE4SS.log (for fixing problems) |
 
-TSW7 doesn't bind = or F11 itself. The fly-by camera uses 6, 7 and F10, so the two mods can run together.
+TSW7 doesn't bind = or F11 itself. The fly-by camera uses 4, 6, 7 and F10, so the two mods can run together.
 
 ## Installing
 

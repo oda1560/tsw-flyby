@@ -281,7 +281,7 @@ def main():
     for mod in mods:
         install_mod(win64, mod)
     if "FlyByCamera" in mods:
-        print("Fly-by camera: load a drive and press 7.")
+        print("Fly-by camera: load a drive and press 7, or 4 for the view from a passenger seat.")
     if "ComfortHUD" in mods:
         print("Comfort HUD: load a drive; the objective box at the top shows the passengers and comfort.")
 

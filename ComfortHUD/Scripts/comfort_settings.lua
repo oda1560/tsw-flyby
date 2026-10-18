@@ -1,7 +1,7 @@
 -- Comfort HUD settings. Restart the game after changing anything here.
 
 return {
-    -- Keys, by their names in UE4SS's Key table. TSW7 leaves = and F11 unbound (the fly-by camera uses 6, 7 and F10).
+    -- Keys, by their names in UE4SS's Key table. TSW7 leaves = and F11 unbound (the fly-by camera has 4, 6, 7 and F10).
     ToggleKey = "OEM_PLUS",   -- the = key: switch the comfort HUD off (the objective box goes back to the game's own)
                               -- and on again. Off, the mod does no work at all, for comparing the framerate.
     ReportKey = "F11",        -- write what the mod can see of the game into UE4SS.log

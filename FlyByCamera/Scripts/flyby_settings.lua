@@ -2,9 +2,10 @@
 -- Restart the game after changing anything here.
 
 return {
-    -- Keys, by their names in UE4SS's Key table. TSW7 leaves 6, 7 and F10 unbound.
+    -- Keys, by their names in UE4SS's Key table. TSW7 binds 4, 6, 7 and F10 only with Ctrl (its DefaultInput.ini).
     FlyByKey = "SEVEN",       -- fly-by camera on; pressed again, move it to a new spot ahead
-    OffKey = "SIX",           -- fly-by camera off, back to the view you had
+    SeatKey = "FOUR",         -- the view from a random passenger seat on your train; pressed again, another seat
+    OffKey = "SIX",           -- fly-by camera or seat view off, back to the view you had
     ReportKey = "F10",        -- write what the mod can see of the game into UE4SS.log
 
     -- The game's own camera keys (from TSW7's input settings): cab, outside, boom, passenger, free camera,
@@ -34,4 +35,15 @@ return {
     MinFov = 20,              -- narrowest field of view (degrees) when zoomed in
     MaxFov = 60,              -- widest field of view when the train is close
     Fov = 55,                 -- field of view when Zoom is false
+
+    -- The seat view: a passenger looking the way their seat faces, out of the window nearest them
+    SeatFov = 70,             -- field of view from a seat
+    SeatEyeHeight = 1.15,     -- eyes this far above a seat that doesn't say where its camera goes
+    SeatWindowTurn = 50,      -- degrees from the way the seat faces, towards the nearest window
+    SeatNeckTurn = 110,       -- glancing about, at most this many degrees from the way the seat faces
+    SeatLookAround = true,    -- the gaze wanders a little, and now and then glances elsewhere for a few seconds
+    SeatShake = 1,            -- how much the head moves with the train: 0 holds it still, 2 is twice as much
+    SeatMouse = true,         -- turn the view with the mouse as well
+    SeatMouseSpeed = 2.5,     -- degrees per step of the game's mouse movement (Unreal's usual, as in the cab)
+    SeatMouseReturn = 3,      -- seconds after you leave the mouse before the gaze goes back; false to leave it there
 }

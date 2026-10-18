@@ -386,6 +386,544 @@ class FlyBy(unittest.TestCase):
         self.sim.run(6.1)
         self.assertEqual(self.logs().count("moved 40 m in 2.0 s"), 3)
 
+    # ---- the seat view
+
+    def sitting(self):
+        """(seat group's address, seat number from 1) the camera is at the eyes of, give or take the head moving;
+        None if it's at none."""
+        cam = self.sim.camera()
+        if cam is None:
+            return None
+        at, _ = self.sim.camera_place(cam)
+        for g in self.sim.groups.values():
+            for i, eye in self.sim.seat_eyes(g, 1.15 * M).items():
+                d = ((at.X - eye.pos.X) ** 2 + (at.Y - eye.pos.Y) ** 2 + (at.Z - eye.pos.Z) ** 2) ** 0.5
+                if d < 6:
+                    return g.address, i
+        return None
+
+    def seat(self):
+        """The fake's seat the camera is in: pos, face."""
+        address, i = self.sitting()
+        return self.sat_group().seats[i]
+
+    def view(self):
+        """The camera's rotation in the world: (pitch, yaw, roll)."""
+        r = self.sim.camera_rot(self.sim.camera())
+        return r.Pitch, r.Yaw, r.Roll
+
+    @staticmethod
+    def wrap(a):
+        return (a + 180) % 360 - 180
+
+    def expected_yaw(self, seat, car=0.0, window=50):
+        """Where the passenger should look: the way their seat faces, turned towards the window nearest them, whichever
+        way the train goes. `car`: the yaw of the car the seat is in."""
+        import math
+        side = (1 if seat.pos.Y > 0 else -1) * (1 if math.cos(math.radians(seat.face)) > 0 else -1)
+        return self.wrap(car + seat.face + side * window)
+
+    def still(self):
+        return {"SeatLookAround": False, "SeatShake": 0}
+
+    def eye_offset(self):
+        """How far the head has moved from the seat's eyes: (along the car, across, up) in cm."""
+        cam = self.sim.camera()
+        eye = self.sim.seat_eyes(self.sat_group(), 1.15 * M)[self.sitting()[1]]
+        at, _ = self.sim.camera_place(cam)
+        return at.X - eye.pos.X, at.Y - eye.pos.Y, at.Z - eye.pos.Z
+
+    def sat_group(self):
+        """The seat group the camera sits in."""
+        seat = self.sitting()
+        self.assertIsNotNone(seat)
+        return next(g for g in self.sim.groups.values() if g.address == seat[0])
+
+    def coach_views(self):
+        return {c.view.address for c in self.sim.coaches.values()}
+
+    def test_4_puts_the_view_in_a_passenger_seat_on_your_train(self):
+        self.start(speed=20 * M)
+        self.assertTrue(self.sim.press("FOUR"))
+        self.assertTrue(self.on_camera())                       # at once: no timing needed
+        self.assertIn(self.sat_group().owner.address, self.coach_views())
+        self.assertEqual(self.sim.camera().fov, 70)
+        self.assertFalse(self.sim.camera().CameraComponent.bConstrainAspectRatio)
+        self.assertIn("on: the view from a seat; 16 passenger seats on your train (5 seat groups on your train's "
+                      "vehicles: 4 passenger, 0 unmarked and 1 crew on your train (by name/role: "
+                      "UKStandardClass/Passenger 4, Driver/None 1), 0 on other trains, 0 away from your train; "
+                      "your train from GetFormation of its RailVehiclePhysicsComponent", self.logs())
+        self.assertRegex(self.logs(), r"in seat \d of Seats\d, a UKStandardClass/Passenger group in "
+                                      r"RVV_Coach_C_1[35] \(vehicle [23] of 3, ")
+        self.no_errors()
+
+    def test_the_seat_rides_along_with_the_train(self):
+        self.start(speed=30 * M)
+        self.sim.press("FOUR")
+        seat = self.sitting()
+        before = self.sim.camera_place(self.sim.camera())[0].X
+        self.sim.run(5)
+        self.assertEqual(self.sitting(), seat)
+        self.assertAlmostEqual(self.sim.camera_place(self.sim.camera())[0].X - before, 150 * M, delta=1 * M)
+        self.assertTrue(self.on_camera())
+        self.assertNotIn("each frame", self.logs())
+        self.assertIn("seat camera at", self.logs())
+        self.no_errors()
+
+    def test_4_again_moves_to_another_seat(self):
+        self.start(speed=20 * M)
+        self.sim.press("FOUR")
+        seats = [self.sitting()]
+        for _ in range(10):
+            self.sim.press("FOUR")
+            self.sim.run(0.1)
+            seats.append(self.sitting())
+            self.assertNotEqual(seats[-1], seats[-2])
+            self.assertTrue(self.on_camera())
+        self.assertEqual(self.logs().count("another seat: 16 passenger seats"), 10)
+        self.assertEqual(len(self.sim.cameras), 1)              # the same camera, moved
+
+    def test_never_the_drivers_seat_or_another_train(self):
+        self.start(speed=20 * M)                                # the AI train is 900 m away
+        owners, kinds = set(), set()
+        for _ in range(40):
+            self.sim.press("FOUR")
+            owners.add(self.sat_group().owner.address)
+            kinds.add(self.sitting()[1] <= 2)
+        self.assertEqual(owners, self.coach_views())
+        self.assertEqual(kinds, {True, False})
+        self.assertIn("eyes the seat's camera offset 0 0 70", self.logs())
+        self.assertIn("eyes 1.15 m above the seat", self.logs())
+
+    def test_if_the_vehicles_wont_list_their_seats_it_searches_the_world_for_them(self):
+        self.start(speed=20 * M, search_only=True)              # the AI train is 900 m away
+        owners = set()
+        for _ in range(20):
+            self.sim.press("FOUR")
+            owners.add(self.sat_group().owner.address)
+        self.assertEqual(owners, self.coach_views())
+        self.assertIn("16 passenger seats on your train (6 seat groups in the world: 4 passenger, 0 unmarked and "
+                      "1 crew on your train (by name/role: UKStandardClass/Passenger 4, Driver/None 1), "
+                      "1 on other trains, 0 away from your train", self.logs())
+
+    def test_6_goes_back_from_the_seat(self):
+        self.start(speed=20 * M)
+        self.sim.press("FOUR")
+        self.sim.run(1)
+        cam = self.sim.camera()
+        self.sim.press("SIX")
+        self.assertTrue(self.sim.viewing(self.sim.pawn))
+        self.assertFalse(cam.valid)
+        self.assertEqual(len(self.sim.frame_fns), 0)
+        self.assertIn("off: you switched it off", self.logs())
+
+    def test_a_camera_key_leaves_the_seat(self):
+        self.start(speed=20 * M)
+        self.sim.press("FOUR")
+        self.sim.press("FIVE")                                  # the game's own passenger view
+        self.sim.game_switches_to(self.sim.outside)
+        self.sim.run(0.1)
+        self.assertTrue(self.sim.viewing(self.sim.outside))
+        self.assertIsNone(self.sim.camera())
+
+    def test_a_camera_key_the_game_ignores_leaves_the_seat_for_the_view_from_before(self):
+        self.start(speed=20 * M)
+        self.sim.press("FOUR")
+        self.sim.press("ONE")
+        self.sim.run(0.5)
+        self.assertTrue(self.sim.viewing(self.sim.pawn))
+        self.assertIsNone(self.sim.camera())
+
+    def test_the_game_taking_the_view_from_the_seat_is_taken_back(self):
+        self.start(speed=20 * M)
+        self.sim.press("FOUR")
+        self.sim.game_switches_to(self.sim.pawn)
+        self.sim.run(0.1)
+        self.assertTrue(self.on_camera())
+        self.assertIsNotNone(self.sitting())
+
+    def test_7_from_the_seat_goes_to_the_fly_by_and_4_back(self):
+        self.start(speed=20 * M)
+        self.sim.press("FOUR")
+        self.sim.run(1)
+        self.sim.press("SEVEN")
+        self.sim.run(0.2)
+        self.assertTrue(self.on_camera())                       # still in the seat while it times the train
+        self.assertIsNotNone(self.sitting())
+        self.sim.run(0.3)
+        cam = self.sim.camera()
+        self.assertIsNone(cam.attach)
+        x, y, _ = self.camera()
+        self.assertAlmostEqual(x - self.train()[0], 8 * 20 * M, delta=10 * M)
+        self.assertAlmostEqual(abs(y), 12 * M, delta=1 * M)
+        self.assertLess(self.sim.aim_error(), 0.5)
+        self.assertIn("fly-by: following RVV_AABS_Class70_C_2", self.logs())
+        self.sim.press("FOUR")
+        self.assertIsNotNone(self.sitting())
+        self.assertEqual(self.sim.camera().fov, 70)
+        self.assertIn("seat view: the view from a seat", self.logs())
+        self.sim.run(1)
+        self.assertIsNotNone(self.sitting())                    # the fly-by doesn't move it any more
+        self.sim.press("SIX")
+        self.assertTrue(self.sim.viewing(self.sim.pawn))        # the view from before either
+        self.assertEqual(len(self.sim.cameras), 1)
+        self.no_errors()
+
+    def test_6_while_timing_from_the_seat_goes_back_to_the_view_from_before(self):
+        self.start(speed=20 * M)
+        self.sim.press("FOUR")
+        self.sim.press("SEVEN")
+        self.sim.run(0.1)
+        self.sim.press("SIX")
+        self.assertTrue(self.sim.viewing(self.sim.pawn))
+        self.assertIsNone(self.sim.camera())
+
+    def test_4_while_the_fly_by_is_timing_goes_to_a_seat(self):
+        self.start(speed=20 * M)
+        self.sim.press("SEVEN")
+        self.sim.run(0.1)
+        self.sim.press("FOUR")
+        self.assertTrue(self.on_camera())
+        self.sim.run(1)
+        self.assertIsNotNone(self.sitting())
+        self.assertNotIn("] new spot", self.logs())
+
+    def test_seats_that_dont_say_what_they_are_still_do(self):
+        self.start(speed=20 * M, unmarked=True)
+        self.sim.press("FOUR")
+        self.assertIn(self.sat_group().owner.address, self.coach_views())
+        self.assertIn("16 unmarked seats on your train", self.logs())
+
+    def test_seats_left_with_the_default_name_go_by_their_role(self):
+        self.start(speed=20 * M, default_names=True)           # as the Class 331's seemed to be
+        owners = set()
+        for _ in range(20):
+            self.assertTrue(self.sim.press("FOUR"))
+            owners.add(self.sat_group().owner.address)
+        self.assertEqual(owners, self.coach_views())            # never the cab, whose role is Engineer
+        self.assertIn("16 passenger seats on your train", self.logs())
+        self.assertIn("(by name/role: Engineer/Passenger 4, Engineer/Engineer 1)", self.logs())
+
+    def test_a_cars_multi_seat_is_passenger_seating(self):
+        self.start(speed=20 * M, multiseat=True)               # as the Class 331's, neither name nor role set
+        self.sim.press("FOUR")
+        self.assertIn(self.sat_group().owner.address, self.coach_views())
+        self.assertIn("16 passenger seats on your train", self.logs())
+        self.assertIn("(by name/role: Engineer/None multi-seat 4, Driver/None 1)", self.logs())
+        self.assertRegex(self.logs(), r"in seat \d of Seats\d, a Engineer/None multi-seat group in RVV_Coach_C_1")
+
+    def test_seats_with_neither_name_nor_role_set_are_unmarked_not_crew(self):
+        self.start(speed=20 * M, unset=True)
+        self.sim.press("FOUR")
+        self.assertIn(self.sat_group().owner.address, self.coach_views())
+        self.assertIn("16 unmarked seats on your train", self.logs())
+        self.assertIn("(by name/role: Engineer/None 4, Driver/None 1)", self.logs())
+
+    def test_without_the_games_list_of_the_train_it_asks_which_vehicles_are_the_players(self):
+        self.start(speed=20 * M, formation=False, consist_lib=True)
+        self.sim.press("FOUR")
+        self.assertIn(self.sat_group().owner.address, self.coach_views())
+        self.assertIn("16 passenger seats on your train", self.logs())
+        self.assertIn("the game saying which vehicles are the player's", self.logs())
+        self.assertNotIn("(vehicle", self.logs())
+
+    def test_without_either_there_are_only_the_seats_of_your_own_vehicle(self):
+        self.start(speed=20 * M, formation=False)
+        self.assertTrue(self.sim.press("FOUR"))
+        self.assertTrue(self.sim.viewing(self.sim.pawn))
+        self.assertIsNone(self.sim.camera())
+        self.assertIn("no passenger seats on your train: 6 seat groups in the world: 0 passenger, 0 unmarked and "
+                      "1 crew on your train (by name/role: Driver/None 1), 5 on other trains", self.logs())
+        self.assertIn("only the vehicle you drive", self.logs())
+        self.sim.press("F10")                                   # the report still lists the seats there are
+        self.assertIn("seats: none on your train", self.logs())
+        self.assertIn("Seats1 in RVV_AABS_Class70_C_2 at ", self.logs())
+        self.assertIn(": crew, Driver/None (name 1, role 0, verb ? nil, custom name nil), 1 seats", self.logs())
+
+    def test_it_prefers_a_seat_nobody_sits_in(self):
+        self.start(speed=20 * M, taken=True)
+        free = self.sim.groups[4]
+        free.seats[3].taken = False
+        self.sim.press("FOUR")
+        self.assertEqual(self.sitting(), (free.address, 3))
+        self.sim.press("FOUR")                                  # all the others are taken: one of them anyway
+        self.assertIsNotNone(self.sitting())
+        self.assertNotEqual(self.sitting(), (free.address, 3))
+
+    def test_if_the_game_wont_attach_the_camera_it_moves_it_each_frame(self):
+        self.start(speed=30 * M, no_attach=True)
+        self.sim.press("FOUR")
+        seat = self.sitting()
+        self.assertIsNotNone(seat)
+        worst = []
+        self.sim.run(3, lambda: worst.append(self.sitting() == seat))
+        self.assertTrue(all(worst))
+        self.assertIn("the game wouldn't attach the camera", self.logs())
+        self.no_errors()
+
+    def test_without_the_seat_functions_it_reads_the_seats_list(self):
+        self.start(speed=20 * M, no_region_functions=True)
+        self.sim.press("FOUR")
+        self.assertIsNotNone(self.sitting())
+        self.assertIn("from LocalPosition)", self.logs())
+
+    def test_a_seat_going_away_moves_to_another_then_off(self):
+        self.start(speed=20 * M)
+        self.sim.press("FOUR")
+        group = self.sat_group()
+        group.valid = False
+        self.sim.run(0.1)
+        self.assertIsNotNone(self.sitting())
+        self.assertNotEqual(self.sitting()[0], group.address)
+        self.assertIn("the seat has gone (its vehicle unloaded?): 12 passenger seats", self.logs())
+        for g in self.sim.groups.values():
+            g.valid = False
+        self.sim.run(0.1)
+        self.assertTrue(self.sim.viewing(self.sim.pawn))
+        self.assertIsNone(self.sim.camera())
+        self.assertIn("off: the seat has gone, and there's no other", self.logs())
+
+    def test_seats_at_the_worlds_origin_arent_used(self):
+        self.start(speed=20 * M, start=1500 * M, seats_on_models=True)
+        self.sim.press("FOUR")
+        self.assertIsNone(self.sim.camera())
+        self.assertIn("6 away from your train", self.logs())
+
+    def test_report_lists_the_seats(self):
+        self.start(speed=20 * M)
+        self.sim.press("F10")
+        self.assertIn("seats: 16 passenger seats on your train of 3 vehicles", self.logs())
+        self.assertIn("Seats2 in RVV_Coach_C_13 (vehicle 2) at ", self.logs())
+        self.assertIn(": passenger, UKStandardClass/Passenger (name 6, role 3, verb ? nil, custom name nil), 4 seats, "
+                      "camera Z offset 60, passengers hidden within 50", self.logs())
+        self.assertIn(": crew, Driver/None (name 1, role 0", self.logs())
+        self.assertIn("seat 0: at 0 -60 45 (GetSeatRegionLocalPosition, LocalPosition 0 -60 45), turned 0 0 0, "
+                      "camera offset 0 0 70, someone in it: false", self.logs())
+        self.sim.press("FOUR")
+        self.sim.press("F10")
+        self.assertIn("camera in a seat", self.logs())
+        self.assertIn("attached to the seat", self.logs())
+        self.no_errors()
+
+    # ---- the passenger's head
+
+    def check_gaze(self, tolerance=1.0, run=1.0):
+        """Presses 4 until it has sat in seats facing both ways on both sides, checking where each one looks."""
+        seen = set()
+        for i in range(100):
+            if len(seen) == 4 and i >= 12:
+                break
+            self.sim.press("FOUR")
+            self.sim.run(run)
+            seat = self.seat()
+            seen.add((seat.face, seat.pos.Y > 0))
+            self.assertAlmostEqual(self.wrap(self.view()[1] - self.expected_yaw(seat)), 0, delta=tolerance)
+        self.assertEqual(len(seen), 4)                          # both ways of facing, both sides
+        self.no_errors()
+
+    def test_the_passenger_looks_the_way_their_seat_faces_out_of_the_nearest_window(self):
+        self.start(self.still(), speed=20 * M, start=100 * M)
+        self.check_gaze()
+        self.assertRegex(self.logs(), r"it faces backwards \(its back 8 cm behind\), the window on their (left|right), "
+                                      r"-?60 cm from the middle of the car")
+        self.assertRegex(self.logs(), r"it faces the way of travel \(its back 8 cm behind\), the window on their")
+
+    def test_a_backward_seat_looks_back_the_way_it_faces_not_round_over_its_shoulder(self):
+        import math
+        self.start(self.still(), speed=20 * M, start=100 * M)
+        for _ in range(30):
+            self.sim.press("FOUR")
+            if self.seat().face == 180:
+                break
+        yaw = self.view()[1]
+        self.assertAlmostEqual(abs(yaw), 130, delta=1)          # back along the train, 50 degrees towards the window
+        self.assertLess(math.cos(math.radians(yaw)), 0)
+        self.assertEqual(math.sin(math.radians(yaw)) > 0, self.seat().pos.Y > 0)
+        self.assertRegex(self.report(), r"looking [+-]130 degrees from the way of travel, the window on their "
+                                        r"(left|right)")
+
+    def test_glancing_about_a_head_never_turns_further_than_a_neck_goes(self):
+        self.start({"SeatShake": 0}, speed=20 * M, start=100 * M)
+        import math
+        worst = []
+
+        def each():                                             # from the way the seat faces now, round the curves
+            fwd = self.sat_group().owner.fwd
+            facing = math.degrees(math.atan2(fwd.Y, fwd.X)) + self.seat().face
+            worst.append(abs(self.wrap(self.view()[1] - facing)))
+        for _ in range(6):
+            self.sim.press("FOUR")
+            self.sim.run(40, each)
+        self.assertLess(max(worst), 110 + 6)                    # the neck, and the gaze wandering about it
+        self.assertGreater(max(worst), 80)                      # glances out of the window
+
+    def report(self):
+        self.sim.press("F10")
+        return self.logs()
+
+    def test_seats_turned_as_the_331s_are_still_face_the_right_way(self):
+        self.start(self.still(), speed=20 * M, start=100 * M, socket_rotation=True)
+        self.check_gaze()
+
+    def test_without_backs_to_find_it_guesses_the_way_from_the_seats_rotation(self):
+        self.start(self.still(), speed=20 * M, start=100 * M, socket_rotation=True, no_backs=True)
+        self.check_gaze()
+        self.assertIn("(guessed from the seat's rotation)", self.logs())
+        self.assertNotIn("its back", self.logs())
+
+    def test_standing_it_looks_towards_the_front_where_the_driver_is(self):
+        self.start(self.still(), speed=0, start=100 * M)
+        self.check_gaze()
+
+    def test_reversing_they_still_look_the_way_their_seats_face(self):
+        self.start(self.still(), speed=-20 * M, start=1000 * M)
+        self.check_gaze()
+        self.assertRegex(self.logs(), r"it faces backwards \(its back 8 cm behind\), the window on their")
+
+    def test_round_a_curve_the_gaze_turns_with_the_train(self):
+        import math
+        self.start(self.still(), speed=20 * M, start=2050 * M, radius=800 * M)
+        self.sim.press("FOUR")
+        worst = []
+        coach = next(i for i, c in self.sim.coaches.items() if c.view.address == self.sat_group().owner.address)
+
+        def each():
+            _, d = self.sim.path(self.sim.s - coach * 2300)
+            travel = math.degrees(math.atan2(d.Y, d.X))
+            worst.append(abs(self.wrap(self.view()[1] - self.expected_yaw(self.seat(), car=travel))))
+        self.sim.run(3)
+        self.sim.run(10, each)
+        self.assertLess(max(worst), 3)                          # it lags a little behind as the line turns
+        self.assertGreater(len(worst), 500)
+
+    def test_the_mouse_turns_the_view_and_then_it_goes_back(self):
+        self.start(self.still(), speed=20 * M, start=100 * M)
+        self.sim.press("FOUR")
+        self.sim.run(0.5)
+        pitch0, yaw0, _ = self.view()
+        self.sim.mouse.dx, self.sim.mouse.dy = 1, 0.5             # the game's mouse movement, 12 frames of it
+        self.sim.run(0.2)
+        self.sim.mouse.dx, self.sim.mouse.dy = 0, 0
+        pitch, yaw, _ = self.view()
+        self.assertAlmostEqual(self.wrap(yaw - yaw0), 12 * 2.5, delta=0.5)
+        self.assertAlmostEqual(pitch - pitch0, 6 * 2.5, delta=0.5)
+        self.assertIn("the mouse turns the seat view (GetInputMouseDelta gave 1.00 0.50)", self.logs())
+        self.sim.run(2.5)
+        self.assertAlmostEqual(self.wrap(self.view()[1] - yaw0), 30, delta=0.5)  # still where you left it...
+        self.sim.run(6)
+        self.assertAlmostEqual(self.wrap(self.view()[1] - yaw0), 0, delta=0.5)   # ...then back to the window
+
+    def test_the_mouse_view_can_stay_where_you_leave_it(self):
+        self.start({**self.still(), "SeatMouseReturn": False}, speed=20 * M, start=100 * M)
+        self.sim.press("FOUR")
+        yaw0 = self.view()[1]
+        self.sim.mouse.dx = -2
+        self.sim.run(0.1)
+        self.sim.mouse.dx = 0
+        self.sim.run(20)
+        self.assertAlmostEqual(self.wrap(self.view()[1] - yaw0), -6 * 2 * 2.5, delta=0.5)
+
+    def test_the_mouse_does_nothing_while_the_cursor_shows(self):
+        self.start(self.still(), speed=20 * M, start=100 * M)
+        self.sim.press("FOUR")
+        yaw0 = self.view()[1]
+        self.sim.pc.bShowMouseCursor = True
+        self.sim.mouse.dx = 3
+        self.sim.run(0.5)
+        self.assertAlmostEqual(self.view()[1], yaw0, delta=0.01)
+
+    def test_the_mouse_as_return_values(self):
+        self.start(self.still(), speed=20 * M, start=100 * M, mouse_returns=True)
+        self.sim.press("FOUR")
+        yaw0 = self.view()[1]
+        self.sim.mouse.dx = 1
+        self.sim.run(0.1)
+        self.assertAlmostEqual(self.wrap(self.view()[1] - yaw0), 6 * 2.5, delta=0.5)
+
+    def test_without_the_mouse_the_seat_view_still_works(self):
+        self.start(self.still(), speed=20 * M, start=100 * M, no_mouse=True)
+        self.sim.press("FOUR")
+        self.sim.run(1)
+        self.assertIsNotNone(self.sitting())
+        self.assertEqual(self.logs().count("can't read the mouse"), 1)
+        self.assertAlmostEqual(self.wrap(self.view()[1] - self.expected_yaw(self.seat())), 0, delta=1)
+
+    def head_moves(self, seconds, **sim):
+        """The furthest the head moves from the seat's eyes (cm) and tilts (degrees), riding for a while."""
+        self.start({"SeatLookAround": False}, start=100 * M, **sim)
+        self.sim.press("FOUR")
+        self.sim.run(1)
+        most, tilt = [0.0], [0.0]
+
+        def each():
+            most[0] = max(most[0], sum(v * v for v in self.eye_offset()) ** 0.5)
+            pitch, _, roll = self.view()
+            tilt[0] = max(tilt[0], abs(roll), abs(pitch))
+        self.sim.run(seconds, each)
+        return most[0], tilt[0]
+
+    def test_the_head_hardly_moves_standing(self):
+        moved, tilt = self.head_moves(8, speed=0)
+        self.assertGreater(moved, 0.1)                          # breathing
+        self.assertLess(moved, 0.6)
+        self.assertLess(tilt, 0.1)
+
+    def test_the_head_shakes_more_the_faster_the_train_goes(self):
+        moved, tilt = self.head_moves(8, speed=30 * M)
+        self.assertGreater(moved, 0.8)
+        self.assertLess(moved, 3)
+        self.assertGreater(tilt, 0.2)
+        self.assertLess(tilt, 1.5)
+
+    def test_with_shake_off_the_head_stays_put(self):
+        self.start(self.still(), speed=30 * M, start=100 * M)
+        self.sim.press("FOUR")
+        self.sim.run(3)
+        self.assertLess(max(abs(v) for v in self.eye_offset()), 1e-6)
+        self.assertEqual(self.view()[2], 0)
+
+    def test_braking_leans_the_head_forward(self):
+        self.start({"SeatLookAround": False}, speed=20 * M, start=100 * M)
+        self.sim.press("FOUR")
+        self.sim.run(2)
+        forward = []
+
+        def brake():
+            self.sim.speed = max(0, self.sim.speed - 2 * M / 60)  # 2 m/s²
+            forward.append(self.eye_offset()[0])
+        self.sim.run(3, brake)
+        self.assertGreater(max(forward), 2)                     # 1.5 cm per m/s², a little more as it swings
+        self.assertLess(max(forward), 6)
+        settled = []
+        self.sim.run(4, lambda: settled.append(self.eye_offset()[0]))
+        self.assertLess(abs(settled[-1]), 0.6)                  # back upright once stopped
+
+    def test_now_and_then_it_glances_elsewhere(self):
+        self.start({"SeatShake": 0}, speed=20 * M, start=100 * M)
+        self.sim.press("FOUR")
+        off = []
+        self.sim.run(90, lambda: off.append(abs(self.wrap(self.view()[1] - self.expected_yaw(self.seat())))))
+        self.assertGreater(max(off), 25)                        # a glance
+        self.assertGreater(sum(1 for o in off if o < 10) / len(off), 0.6)  # mostly ahead out of the window
+        self.assertGreater(sum(1 for o in off if o > 0.5) / len(off), 0.5) # the gaze wanders a little
+
+    def test_turning_by_rotators(self):
+        self.start()
+        fm = self.lua.eval('(require("flyby_math"))')
+        r = lambda p, y, w: self.lua.table_from({"Pitch": p, "Yaw": y, "Roll": w})
+        v = lambda x, y, z: self.lua.table_from({"X": x, "Y": y, "Z": z})
+        vd = lambda t: (t.X, t.Y, t.Z)
+        rd = lambda t: (t.Pitch, t.Yaw, t.Roll)
+        close = lambda a, b: self.assertLess(sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5, 1e-6)
+        close(vd(fm.turn(r(0, 90, 0), v(1, 0, 0))), (0, 1, 0))                 # yaw 90: forward is +Y
+        close(vd(fm.turn(r(90, 0, 0), v(1, 0, 0))), (0, 0, 1))                 # pitch 90: forward is up
+        close(rd(fm.combine(r(0, 90, 0), r(0, 90, 0))), (0, 180, 0))
+        a, b = r(20, -35, 10), r(-5, 120, 30)
+        close(rd(fm.combine(a, r(0, 0, 0))), rd(a))
+        close(rd(fm.combine(r(0, 0, 0), b)), rd(b))
+        p = v(3, -7, 11)
+        close(vd(fm.turn(fm.combine(a, b), p)), vd(fm.turn(a, fm.turn(b, p))))
+
     def test_report_runs_on_and_off(self):
         self.start(speed=20 * M)
         self.sim.press("F10")

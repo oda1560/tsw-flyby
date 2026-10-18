@@ -267,4 +267,48 @@ function M.needs_new_spot(cam, train, tr, placed_dir, s)
     return nil
 end
 
+----------------------------------------------------------------------------------------------------
+-- The seat view: a seat sits turned in its seat component, which sits turned in its vehicle.
+
+-- The forward, right and up axes of an Unreal rotator (as FRotationMatrix has them).
+function M.axes(r)
+    local p, y, w = math.rad(r.Pitch or 0), math.rad(r.Yaw or 0), math.rad(r.Roll or 0)
+    local sp, cp, sy, cy, sr, cr = math.sin(p), math.cos(p), math.sin(y), math.cos(y), math.sin(w), math.cos(w)
+    return vec(cp * cy, cp * sy, sp),
+        vec(sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, -sr * cp),
+        vec(-(cr * sp * cy + sr * sy), cy * sr - cr * sp * sy, cr * cp)
+end
+
+local function dot(a, b) return a.X * b.X + a.Y * b.Y + a.Z * b.Z end
+
+-- `v`, given in a frame turned by `r`, in the frame outside it.
+function M.turn(r, v)
+    local x, y, z = M.axes(r)
+    return vec(x.X * v.X + y.X * v.Y + z.X * v.Z, x.Y * v.X + y.Y * v.Y + z.Y * v.Z,
+        x.Z * v.X + y.Z * v.Y + z.Z * v.Z)
+end
+
+-- `v`, given in the frame outside, in the frame turned by `r`: M.turn backwards.
+function M.unturn(r, v)
+    local x, y, z = M.axes(r)
+    return vec(dot(v, x), dot(v, y), dot(v, z))
+end
+
+-- The rotation of something turned by `inner` in a frame turned by `outer` (back to a rotator as FMatrix does).
+function M.combine(outer, inner)
+    local x, y, z = M.axes(inner)
+    x, y, z = M.turn(outer, x), M.turn(outer, y), M.turn(outer, z)
+    local pitch = math.deg(math.atan(x.Z, math.sqrt(x.X * x.X + x.Y * x.Y)))
+    local yaw = math.deg(math.atan(x.Y, x.X))
+    local _, flat_right = M.axes({ Pitch = pitch, Yaw = yaw, Roll = 0 })
+    return { Pitch = pitch, Yaw = yaw, Roll = math.deg(math.atan(dot(z, flat_right), dot(y, flat_right))) }
+end
+
+-- Where a seat's camera goes, in its seat component's frame: the seat's own camera offset, turned with the seat, or
+-- `eye_height` centimetres straight up from the seat when it gives none.
+function M.seat_eye(pos, rot, offset, eye_height)
+    if offset and M.len(offset) > 0.5 then return M.add(pos, M.turn(rot, offset)) end
+    return M.add(pos, vec(0, 0, eye_height))
+end
+
 return M

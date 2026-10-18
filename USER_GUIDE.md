@@ -6,17 +6,22 @@ Last updated 2026-10-18
 
 Press **7** while driving in Train Sim World 7. After a moment spent timing your train, the view cuts to a camera standing beside the line ahead of it, like a railfan with a camera. It turns to follow the train as it goes by. Once the train is well past, the camera jumps ahead to a new spot, swapping sides each time. Press **7** again to jump to a new spot ahead straight away. Press **6** to go back to your own view.
 
-You can keep driving while it's on: the game's controls, HUD and keys all still work.
+Press **4** for the view from a random passenger seat on your train. The camera sits at a passenger's eye height and rides along with the train. Press **4** again to move to another random seat. From the seat view, **7** goes to the fly-by camera, and from the fly-by, **4** goes to a seat.
+
+The passenger looks the way their seat faces, turned towards the window nearest them: ahead in a forward-facing seat, back along the train in a backward-facing one. Their gaze wanders a little, and now and then they glance elsewhere for a few seconds: straight out of the window, back along the train, across the car, or down. Their head shakes with the track, more the faster the train goes. It leans back as the train speeds up, forward as it brakes and out on curves. Move the mouse to look around yourself; a few seconds after you leave it, the passenger goes back to looking out of the window.
+
+You can keep driving while either view is on: the game's controls, HUD and keys all still work.
 
 Pressing one of the game's own camera keys also hands the view back: 1 (cab), 2 (boom), 3 (outside), 5 (passenger), 8 (free camera), 0 (camera shortcuts) or Shift+Space (photo mode). If the game switches cameras by itself, the mod takes the view back. If the game keeps doing that, the mod gives up and leaves the game's view.
 
 | Key | What it does |
 | --- | --- |
 | 7 | Fly-by camera on; pressed again, move it to a new spot ahead |
-| 6 | Fly-by camera off, back to the view you had |
+| 4 | View from a random passenger seat; pressed again, another seat |
+| 6 | Fly-by camera or seat view off, back to the view you had |
 | F10 | Write a report of what the mod can see into UE4SS.log (for fixing problems) |
 
-TSW7 doesn't bind 6, 7 or F10 itself.
+TSW7 binds 4, 6, 7 and F10 only with Ctrl, according to its own `DefaultInput.ini`. 4 sits next to 5, the game's own passenger camera.
 
 The other mod here, the comfort HUD, puts passenger numbers and comfort warnings in the game's objective box: see [its guide](COMFORT_HUD_GUIDE.md).
 
@@ -57,7 +62,7 @@ Steam's "Verify integrity of game files" leaves these files alone. A game update
 
 ## Changing how it behaves
 
-The settings are in `FlyByCamera\Scripts\flyby_settings.lua`: how far ahead and to the side the camera stands, when it moves on, which side, zoom, and the keys. Edit the copy here and run **Install fly-by camera.bat** again, then restart the game.
+The settings are in `FlyByCamera\Scripts\flyby_settings.lua`: how far ahead and to the side the camera stands, when it moves on, which side, zoom, the seat view, and the keys. Edit the copy here and run **Install fly-by camera.bat** again, then restart the game.
 
 A few you may want:
 
@@ -67,6 +72,14 @@ A few you may want:
 - **PassDistance:** how far past the train goes before the camera moves on, 200 m. Raise it for long trains.
 - **Zoom:** zooms in while the train is far away. Set to `false` for a fixed `Fov`.
 - **CheckView:** before picking a spot, looks for hills, cuttings, walls and buildings in the way, and stands the camera on the ground.
+- **SeatFov:** the field of view from a seat, 70 degrees.
+- **SeatEyeHeight:** for seats that don't say where a seated passenger's eyes are, the camera goes 1.15 m above the seat.
+- **SeatKey:** `"FOUR"`. Any key name from UE4SS's Key table works.
+- **SeatWindowTurn:** how far round from the way their seat faces towards the window the passenger looks, 50 degrees.
+- **SeatNeckTurn:** the furthest round from the way their seat faces they turn their head when they glance about, 110 degrees.
+- **SeatLookAround:** `false` keeps the gaze steady, with no wandering or glances.
+- **SeatShake:** how much the head moves with the train. `0` holds it still; `2` is twice as much.
+- **SeatMouse, SeatMouseSpeed, SeatMouseReturn:** turning the view with the mouse, at 2.5 degrees per step of the game's mouse movement (as in the cab). `SeatMouseReturn` is the seconds before the gaze goes back by itself; `false` leaves it where you put it.
 
 ## How it picks a spot
 
@@ -81,6 +94,19 @@ It times your train for its speed, and reads the vehicle's heading for the direc
 
 It carries that curve on ahead to guess where the line goes, then tries spots beside that point. It traces a line from each spot across to the track and towards the train, and takes the first spot with a clear view of both. It doesn't read the game's track data (yet), so a spot can be off just after a change of curve, a junction or a tunnel mouth. Press 7 for another.
 
+## How it picks a seat
+
+The seats are the game's own: the ones you can sit in when walking through a train. Each vehicle has groups of them, with each seat's position, the way it faces and where a seated passenger's eyes go. A cab seat or two is a `SeatComponent`; a car's passenger seating is usually one `MultiSeatComponent`.
+
+1. It asks the game for the vehicles of your train, and finds the seat groups on them.
+2. It goes by each group's role first (passenger, driver or guard), then its name (first class, standard class, driver's seat, steps and so on). Some trains (the Class 331 for one) leave the name at the game's default, which reads as "Engineer", so that name alone doesn't count. A multi-seat counts as passenger seating unless its role says otherwise. It leaves out cab seats, guard's seats, steps and ladders. If no seat on the train says what it is, any of them will do.
+3. It picks a random seat, preferring one with no passenger of the game's sitting in it, and never the one you're already in.
+4. It attaches the camera to the seat, so it rides with the train exactly. If the game won't attach it, the camera is moved to the seat every frame instead.
+5. It works out which way the seat faces by finding its back: a short line traced forward and back from the passenger's eyes hits the headrest on one side. If neither side hits anything, it goes by the seat's own rotation. Unreal's characters face their Y axis, and the Class 331's seats are turned that way.
+6. Each frame, the passenger's head (`seat_head.lua`) decides where they look and how far it has moved. Where they look follows their seat and their window, whichever way the train goes. How their head leans and shakes follows the train: its speed and way of travel come from the vehicle's own velocity.
+
+If your vehicles won't list their seats, it searches every seat in the world and keeps those on your train. Seats more than 1 km from your vehicle are left out.
+
 ## When something's wrong
 
 Everything the mod does is written to `ue4ss\UE4SS.log` in the game's Win64 folder, on lines starting `[FlyBy]`:
@@ -89,8 +115,11 @@ Everything the mod does is written to `ue4ss\UE4SS.log` in the game's Win64 fold
 - **Each spot:** how far ahead, which side, the ground height, and whether the line and the train are in view.
 - **Every 2 seconds while on:** where the train is and how far it moved. Turn these off with `DebugLog = false`.
 - **The game taking the view:** each time, and what it switched to.
+- **Each seat:** which seat and vehicle, where the eyes went, which way it faces, and whether the camera is attached. Before that, how many seats it found on your train, on other trains and away from the train.
+- **Every 2 seconds in a seat:** where the camera is and how far from the middle of its vehicle (it stays the same if the camera rides along properly), the speed, and how far round from the way of travel the passenger is looking.
+- **The mouse:** the first time it turns the seat view, or that it can't be read.
 
-Pressing **F10** in a drive adds a report: which vehicle it would follow, everything the driver is attached to and where, and the game's camera functions.
+Pressing **F10** in a drive adds a report: which vehicle it would follow, everything the driver is attached to and where, the game's camera functions, and the first few seat groups on your train with what the game says about them.
 
 **Nothing happens on 7:**
 - Check `UE4SS.log` exists. If it doesn't, UE4SS didn't load.
@@ -99,6 +128,8 @@ Pressing **F10** in a drive adds a report: which vehicle it would follow, everyt
 **The view flicks back:** look for `the game took the view` and `the game keeps taking the view back` in the log, with what the game switched to.
 
 **The camera is somewhere odd:** the `new spot` and `train at` lines show where the train was and what the mod found there.
+
+**4 says there are no passenger seats:** the line after it says how many seat groups it found and where. A freight train has none.
 
 **Removing:**
 - **Uninstall fly-by camera.bat** removes the mod and leaves UE4SS and the comfort HUD.
@@ -117,13 +148,31 @@ Pressing **F10** in a drive adds a report: which vehicle it would follow, everyt
 - The game never took the view by itself.
 - On a gentle right-hand curve (about 3 km radius) the first spot came within 6 m of the line instead of 12, because the curve wasn't known yet at switch-on. Since fixed by reading the train's heading.
 
+**Seat view, first try, same day (Airedale & Wharfedale, Class 331):**
+- 4 did nothing. The mod found the train's 13 seat groups but counted every one as crew. The 331's passenger seating has its role set to Passenger and its name left at the default ("Engineer"), and the mod checked the name first. Since fixed: the role goes first.
+- The game's own list of the train (GetFormation) came back empty, as it did for the comfort HUD. The game's IsConsistPlayerDriven found the train instead.
+
+**Seat view, second try, same day and train:**
+- 4 put the camera in the passenger seats: 184 of them in 3 multi-seats, the camera attached at the game's own eye point for each (118 cm above the seat).
+- Every seat logged "facing sideways": the seats are turned a quarter turn from what the mod assumed. Since fixed: the view now follows the passenger's gaze, and the seat's facing comes from its back.
+- You asked for a more human view: looking ahead out of the nearest window, the head moving with the train, and the mouse to look around. That's what the passenger's head now does.
+
+**Seat view, third try, same day and train:**
+- Nearly right. Passengers in backward-facing seats looked round towards the front, which looked like their heads were turned too far. Since fixed: everyone looks the way their seat faces, towards their own window.
+
 **Still to see in the game:**
 - the first spot on curves since that fix
 - the camera moving itself on once the train is past (every test so far was switched off first)
 - 7 moving to a new spot while on
+- the passenger's head in the game. The seat classes and their fields were read from `TrainSimWorld.exe` and the 331's own blueprints, and the key bindings from the game's `DefaultInput.ini`. Still to see:
+  - whether the line traces find the seats' backs (`its back ... behind` in the log) or it has to guess
+  - whether the gaze, shake and glances feel right
+  - whether the mouse turns it (`the mouse turns the seat view` in the log)
+  - whether the game hides the passenger in that seat
 
 ## For working on it
 
-- `FlyByCamera\Scripts\main.lua`: the parts that talk to the game: keys, the camera, finding the train, the once-a-frame update.
-- `FlyByCamera\Scripts\flyby_math.lua`: following the train, guessing the line ahead, picking and scoring spots. No game objects in it.
-- `tests\`: runs the real Lua through [lupa](https://pypi.org/project/lupa/) against `tests\fake_ue4ss.lua`, a train driving a line that curves, with ground and walls. Run `python -m unittest discover tests`. lupa is installed in `F:\TSW mod downloads\pylib`, which the tests find by themselves.
+- `FlyByCamera\Scripts\main.lua`: the parts that talk to the game: keys, the camera, finding the train and its seats, the once-a-frame update.
+- `FlyByCamera\Scripts\flyby_math.lua`: following the train, guessing the line ahead, picking and scoring spots, turning a seat's position into the world's. No game objects in it.
+- `FlyByCamera\Scripts\seat_head.lua`: the seat view's passenger: where they look and how their head moves. No game objects in it either.
+- `tests\`: runs the real Lua through [lupa](https://pypi.org/project/lupa/) against `tests\fake_ue4ss.lua`, a train driving a line that curves, with ground and walls, two coaches with seats behind the loco, and an AI train with seats of its own. Run `python -m unittest discover tests`. lupa is installed in `F:\TSW mod downloads\pylib`, which the tests find by themselves.
