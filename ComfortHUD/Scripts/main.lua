@@ -6,9 +6,16 @@
 -- Press = to switch it off and on, F11 for a report. Everything it does is written to UE4SS.log, lines starting
 -- [Comfort].
 --
--- It reads everything from the game itself, a few calls a frame: no window over the game and no requests to the
--- game's web API. Searches through all the game's objects take milliseconds, so they're only made when something
--- changes (another train, a drive loading), never on a timer while you drive.
+-- It reads everything from the game itself: no window over the game and no requests to the game's web API. Each
+-- frame it asks the game two things, the time and the train's velocity; the rest is its own arithmetic, and the
+-- objective box's text is only written when the words change. Searches through all the game's objects take
+-- milliseconds, so they're only made when something changes (a drive loading), never on a timer.
+--
+-- The game functions it calls, and their parameters, were read from the game's own reflection tables in
+-- TrainSimWorld.exe: RailVehicle GetFormation(EActorConnectionIterationMode) -> the vehicles of the train;
+-- PassengerCargoModelComponent GetPassengerCount() -> int; PlayerController GetDrivenServiceName(out FName);
+-- PhysicsFunctionLibrary GetSimulationNodeParameterAsBool(context, {{component, node}, {pin, name}}), the way the
+-- game's own blueprints read a train's simulation (pin -1, by name).
 
 local UEHelpers = require("UEHelpers")
 local J = require("comfort_judge")
@@ -16,13 +23,15 @@ local T = require("hud_text")
 local S = require("comfort_settings")
 
 local FEED_EVERY = 1 / 15       -- s between readings for the judge (tsw-joystick read 15 a second)
-local LOOK_EVERY = 1.0          -- s between looking at the train, its service and the objective box
+local LOOK_EVERY = 1.0          -- s between looking at the train and the objective box
+local SERVICE_EVERY = 5.0       -- s between reading the service's name
 local COUNT_EVERY = 5.0         -- s between counting the passengers while stopped (they don't change on the move)
-local CHECK_EVERY = 0.5         -- s between checking the game hasn't written over what the box says
+local CHECK_EVERY = 2.0         -- s between checking the game hasn't written over the box without a hook seeing it
 local REFIND_EVERY = 5.0        -- s at least between searches for the player or the objective box
 local DEBUG_EVERY = 5.0
 local MAX_CARS = 16
 local WHITE = { R = 1.0, G = 1.0, B = 1.0, A = 1.0 }
+local FRONT_TO_BACK = 0         -- EActorConnectionIterationMode::FrontToBack: GetFormation's whole train
 
 local OBJECTIVE_CLASS = "/Script/TS2Prototype.TS2HUDObjectiveWidget"
 local WIDGET_CLASSES = { "HUDObjectiveWidget_C", "HUDObjectiveWidget_Minimal_C" } -- the full and the minimal HUD
@@ -32,6 +41,14 @@ local WIDGET_HOOKS = {
     "/Game/Core/Assets/HUD/Widgets/Objectives/HUDObjectiveWidget_Minimal.HUDObjectiveWidget_Minimal_C:UpdateObjectiveText",
     "/Game/Core/Assets/HUD/Widgets/Objectives/HUDObjectiveWidget_Minimal.HUDObjectiveWidget_Minimal_C:ShowObjective",
 }
+-- The game's function libraries that have the static functions used here
+local LIBRARIES = { "PhysicsFunctionLibrary", "TS2GameplayFunctionLibrary", "TS2BlueprintSupportLibrary",
+                    "TSWVehicleFunctionLibrary", "TS2VehicleControlLibrary", "DTGFunctionLibrary" }
+-- The simulation nodes that apply a train's own holding brake (tsw-joystick's HOLD_NODES): a Class 350's comes on
+-- at 0.62 m/s with no power and brakes it 0.9-1.0 m/s² with the handle off. A train has only some of them.
+local SIM_COMPONENT = "Simulation"
+local HOLD_NODES = { "DirectBrakeControlPowered", "DirectBrakeControlUnpowered", "DirectBrakeControl", "EP_BrakeControl" }
+local HOLD_PARAMETER = "BrakeHoldActive"
 
 local function log(fmt, ...)
     print("[Comfort] " .. string.format(fmt, ...) .. "\n")
@@ -83,6 +100,14 @@ local function make_text(s)
     return text_lib:Conv_StringToText(s)
 end
 
+local function fname(s)
+    if FName then
+        local ok, n = pcall(FName, s, EFindName and EFindName.FNAME_Add or nil)
+        if ok and n ~= nil then return n end
+    end
+    return s
+end
+
 local function attach_chain(actor)
     local chain = {}
     for _ = 1, 8 do
@@ -100,27 +125,81 @@ local function is_a(actor, class)
     return ok and yes == true
 end
 
-local function count_of(t)
-    local n = 0
-    for _ in pairs(t) do n = n + 1 end
-    return n
+-- Goes through a TArray the game gave (or a Lua table), calling fn(element).
+local function each_in(arr, fn)
+    local ok, for_each = pcall(function() return arr.ForEach end)
+    if ok and for_each then
+        arr:ForEach(function(_, elem) fn(elem:get()) end)
+    else
+        for _, v in ipairs(arr) do fn(v) end
+    end
+end
+
+-- Calls a game function whose last parameter is an out parameter: UE4SS gives that back in the table passed for it,
+-- or after the return value. (ok, return value, out value), or (false, error).
+local function call_out(obj, name, ...)
+    local out = {}
+    local args = table.pack(...)
+    args.n = args.n + 1
+    args[args.n] = out
+    local r = table.pack(pcall(function() return obj[name](obj, table.unpack(args, 1, args.n)) end))
+    if not r[1] then return false, r[2] end
+    local value = r[3]
+    if value == nil then
+        for _, v in pairs(out) do
+            value = v
+            break
+        end
+    end
+    return true, r[2], value
+end
+
+local classes = {}
+local function class(path)
+    local c = classes[path]
+    if not valid(c) then
+        c = StaticFindObject(path)
+        classes[path] = c
+    end
+    return c
+end
+
+-- The class default object of the game's function library that has the static function `name` (called through it).
+local libraries = {}
+local function library_for(name)
+    local lib = libraries[name]
+    if lib ~= nil then return lib or nil end
+    for _, cls in ipairs(LIBRARIES) do
+        if valid(StaticFindObject("/Script/TS2Prototype." .. cls .. ":" .. name)) then
+            local cdo = StaticFindObject("/Script/TS2Prototype.Default__" .. cls)
+            if valid(cdo) then
+                libraries[name] = cdo
+                return cdo
+            end
+        end
+    end
+    libraries[name] = false
+    return nil
 end
 
 local state = {
     on = true, loop = nil,
-    pc = nil, pc_stale = true, pc_looked = -math.huge,
-    drivable = nil, view = nil, service = nil, aboard = false,
-    cars = nil, passenger_train = false, passengers = nil, counted_at = -math.huge, count_failed = false,
-    samples = {}, speed = 0.0, acc = nil,
+    pc = nil, pc_stale = true, pc_looked = -math.huge, statics = nil,
+    drivable = nil, view = nil, service = nil, service_at = -math.huge, aboard = false,
+    cars = nil, vehicles = nil, passenger_train = false, passengers = nil, counted_at = -math.huge,
+    count_failed = false, hold_refs = nil, hold_failed = false, hold = nil,
+    samples = {}, speed = 0.0, acc = nil, fed_t = nil,
     judge = J.new(),
-    looked_at = -math.huge, fed_at = -math.huge, checked_at = -math.huge, debug_at = -math.huge,
+    info = { passengers = nil, score = nil, cost = nil, panel = nil },   -- what the box shows, from the last reading
+    looked_at = -math.huge, fed_at = -math.huge, checked_at = -math.huge, debug_at = -math.huge, hud_at = -math.huge,
     stop = nil,                 -- the stop the train is at: {station}
     slow_change = false,        -- the objective moved on or the passengers changed since the train last went fast
     work = { total = 0.0, frames = 0, most = 0.0 },
 }
 
 local hud = {
-    widgets = {},               -- address -> {obj, title, colour, line (what the mod put there, nil: the game's own)}
+    widgets = {},               -- address -> {obj, visible, game_title, game_line (the game's own), title, colour,
+                                --   line (what the mod put there, nil: the game's own)}
     hooks = nil,                -- hook paths registered, once the widgets' blueprint is loaded
     hook_calls = 0, dirty = false, searched_at = -math.huge, notified = false,
     game_title = nil,           -- the objective's name as the game has it, for telling a stop at a station
@@ -137,10 +216,8 @@ end
 
 -- The game's own time: it stands still while paused and goes slower than the wall clock below 20 fps.
 local function game_time()
-    if valid(state.pc) then
-        local ok, t = pcall(function() return UEHelpers.GetGameplayStatics():GetTimeSeconds(state.pc) end)
-        if ok and type(t) == "number" then return t end
-    end
+    local ok, t = pcall(function() return state.statics:GetTimeSeconds(state.pc) end)
+    if ok and type(t) == "number" then return t end
     return nil
 end
 
@@ -156,14 +233,15 @@ local function player_controller(now)
     local pc = UEHelpers.GetPlayerController()
     state.pc_stale = false
     if valid(pc) then state.pc = pc else state.pc = nil end
+    state.statics = UEHelpers.GetGameplayStatics()
     return state.pc
 end
 
 -- The rail vehicle you drive: the model half TSW splits each vehicle into (RVM_..., at the world's origin).
 local function find_drivable(pc)
-    local ok, d = pcall(function() return pc:GetCurrentLocalDrivableActor() end)
+    local ok, d = pcall(function() return pc:GetCurrentLocalDrivableActor(pc:GetWorld()) end)
     if ok and valid(d) then return d end
-    local rv = StaticFindObject("/Script/TS2Prototype.RailVehicle")
+    local rv = class("/Script/TS2Prototype.RailVehicle")
     for _, a in ipairs(attach_chain(pc.Pawn)) do
         if is_a(a, rv) then return a end
     end
@@ -172,7 +250,7 @@ end
 
 -- The moving half of the vehicle the driver is in (RVV_...): its velocity is the train's.
 local function find_view(pc)
-    local cls = StaticFindObject("/Script/TS2Prototype.RailVehicleView")
+    local cls = class("/Script/TS2Prototype.RailVehicleView")
     for _, a in ipairs(attach_chain(pc.Pawn)) do
         if is_a(a, cls) then return a end
     end
@@ -180,100 +258,89 @@ local function find_view(pc)
 end
 
 local function service_name(pc)
-    local ok, name = pcall(function() return pc:GetDrivenServiceName() end)
+    local ok, _, name = call_out(pc, "GetDrivenServiceName")
     local s = ok and text_of(name) or nil
     if s == nil or s == "" or s == "None" then return nil end
     return s
 end
 
-local function gameplay_lib()
-    for _, path in ipairs({ "/Script/TS2Prototype.Default__TS2GameplayFunctionLibrary",
-                            "/Script/TS2Prototype.Default__TS2BlueprintSupportLibrary" }) do
-        local lib = StaticFindObject(path)
-        if valid(lib) then return lib end
-    end
+-- The vehicles of your train, front to back (the game's GetFormation). nil and why if it won't say.
+local function formation(drivable)
+    local ok, arr = pcall(function() return drivable:GetFormation(FRONT_TO_BACK) end)
+    if not ok or arr == nil then return nil, ok and "it gave nothing" or tostring(arr) end
+    local list, mine = {}, false
+    local me = drivable:GetAddress()
+    local ok2, err = pcall(each_in, arr, function(v)
+        if valid(v) then
+            list[#list + 1] = v
+            if v:GetAddress() == me then mine = true end
+        end
+    end)
+    if not ok2 then return nil, tostring(err) end
+    if not mine then return nil, string.format("its %d vehicles left out the one you drive", #list) end
+    return list
+end
+
+local function cargo_of(vehicle)
+    local ok, c = pcall(function()
+        return vehicle:GetComponentByClass(class("/Script/TS2Prototype.PassengerCargoModelComponent"))
+    end)
+    if ok and valid(c) then return c end
     return nil
 end
 
-local function formation_of(rv)
-    local ok, f = pcall(function() return rv:GetFormation() end)
-    if ok and valid(f) then return f:GetAddress() end
-    return nil
-end
-
--- How to tell a vehicle is in your train: (what it goes by, test(vehicle)).
-local function membership(drivable)
-    local mine = formation_of(drivable)
-    if mine then
-        return "same formation", function(o) return formation_of(o) == mine end
-    end
-    local lib = gameplay_lib()
-    if lib then
-        local ok, yes = pcall(function() return lib:AreRailVehiclesInSameFormation(drivable, drivable) end)
-        if ok and yes == true then
-            return "AreRailVehiclesInSameFormation", function(o)
-                local ok2, y = pcall(function() return lib:AreRailVehiclesInSameFormation(drivable, o) end)
-                return ok2 and y == true
-            end
-        end
-        ok, yes = pcall(function() return lib:IsConsistPlayerDriven(drivable) end)
-        if ok and yes == true then
-            return "IsConsistPlayerDriven", function(o)
-                local ok2, y = pcall(function() return lib:IsConsistPlayerDriven(o) end)
-                return ok2 and y == true
-            end
-        end
-    end
-    return "only the vehicle you drive: couldn't tell which others are in your train",
-        function(o) return same(o, drivable) end
-end
-
--- The passenger cars of your train: their PassengerCargoModel components. Looked for once a train, as it's a search
--- through all the game's objects.
-local function find_cars(drivable)
+-- The passenger cars of your train: their PassengerCargoModel components. From the game's list of your train;
+-- if it won't give one, every passenger car in the world is looked through (a search), keeping those the game says
+-- are on the player's train, or else only the one you drive.
+local function find_cars(drivable, quiet)
     local started = os.clock()
-    local all = FindAllOf("PassengerCargoModelComponent") or {}
-    local how, mine = membership(drivable)
-    local cars = {}
-    for _, c in ipairs(all) do
-        if valid(c) then
+    local vehicles, why = formation(drivable)
+    local cars, how = {}, nil
+    if vehicles then
+        for _, v in ipairs(vehicles) do
+            local c = cargo_of(v)
+            if c and #cars < MAX_CARS then cars[#cars + 1] = c end
+        end
+        how = string.format("the game's list of your train, %d vehicle%s", #vehicles, #vehicles == 1 and "" or "s")
+    else
+        local all = FindAllOf("PassengerCargoModelComponent") or {}
+        local mine = function(o) return same(o, drivable) end
+        how = string.format("only the vehicle you drive, of %d in the world: the game wouldn't list your train (%s)",
+            #all, why)
+        local lib = library_for("IsConsistPlayerDriven")
+        if lib then
+            local ok, yes = call_out(lib, "IsConsistPlayerDriven", drivable)
+            if ok and yes == true then
+                mine = function(o)
+                    local ok2, y = call_out(lib, "IsConsistPlayerDriven", o)
+                    return ok2 and y == true
+                end
+                how = string.format("the player's trains, of %d in the world: the game wouldn't list your train (%s)",
+                    #all, why)
+            end
+        end
+        for _, c in ipairs(all) do
             local ok, owner = pcall(function() return c:GetOwner() end)
-            if ok and valid(owner) and mine(owner) then cars[#cars + 1] = c end
+            if ok and valid(owner) and mine(owner) and #cars < MAX_CARS then cars[#cars + 1] = c end
         end
-        if #cars >= MAX_CARS then break end
     end
-    log("%d passenger car%s on your train of %d in the world (%s); looked in %.0f ms", #cars, #cars == 1 and "" or "s",
-        #all, how, (os.clock() - started) * 1000)
+    state.vehicles = vehicles and #vehicles or nil
+    if not quiet then
+        log("%d passenger car%s on your train (%s); looked in %.0f ms", #cars, #cars == 1 and "" or "s", how,
+            (os.clock() - started) * 1000)
+    end
     return cars
-end
-
--- A number a game function gives: as what it returns, or in a table for its out parameter. nil and why if neither.
-local function number_from(obj, fname)
-    local ok, n = pcall(function() return obj[fname](obj) end)
-    if ok and type(n) == "number" then return n end
-    local why = ok and ("it gave " .. type(n)) or tostring(n)
-    local out = {}
-    local ok2, r = pcall(function() return obj[fname](obj, out) end)
-    if ok2 then
-        if type(r) == "number" then return r end
-        for _, v in pairs(out) do
-            if type(v) == "number" then return v end
-        end
-    end
-    return nil, why
 end
 
 -- The passengers aboard, nil if they can't be counted.
 local function count_passengers(cars)
     local total, counted, err = 0, false, nil
     for _, c in ipairs(cars) do
-        if valid(c) then
-            local n, why = number_from(c, "GetPassengerCount")
-            if n then
-                total, counted = total + n, true
-            else
-                err = why
-            end
+        local ok, n = pcall(function() return c:GetPassengerCount() end)
+        if ok and type(n) == "number" then
+            total, counted = total + n, true
+        else
+            err = ok and ("it gave " .. type(n)) or tostring(n)
         end
     end
     if not counted and err and not state.count_failed then
@@ -287,6 +354,58 @@ end
 local function judged_passengers()
     if state.passengers ~= nil then return state.passengers end
     return state.passenger_train and 0 or nil
+end
+
+-- The train's own holding brake, as the game's blueprints read a simulation: the parameter references for the
+-- nodes this train has. Empty: it has none.
+local function find_hold(drivable)
+    local lib = library_for("GetSimulationNodeParameterAsBool")
+    if not lib then
+        log("can't read the train's own holding brake: the game's GetSimulationNodeParameterAsBool wasn't found")
+        return {}
+    end
+    local exists = library_for("DoesSimulationNodeExist")
+    local refs, names = {}, {}
+    for _, node in ipairs(HOLD_NODES) do
+        local has = true
+        if exists then
+            local ok, yes = pcall(function()
+                return exists:DoesSimulationNodeExist(drivable,
+                    { ComponentName = fname(SIM_COMPONENT), NodeName = fname(node) })
+            end)
+            has = ok and yes == true
+        end
+        if has then
+            refs[#refs + 1] = { NodeReference = { ComponentName = fname(SIM_COMPONENT), NodeName = fname(node) },
+                                ParameterReference = { PinIndex = -1, Name = fname(HOLD_PARAMETER) } }
+            names[#names + 1] = node
+        end
+    end
+    log("the train's own holding brake: %s", #names > 0 and table.concat(names, ", ") or "none")
+    return refs
+end
+
+-- Whether the train's own holding brake is on (nil: it hasn't one). Only read while the train is coming to a stop or
+-- moving off, slower than MOVING, where it matters: standing, it's as it was.
+local function holding()
+    local refs = state.hold_refs
+    if refs == nil or #refs == 0 then return nil end
+    if state.speed >= J.MOVING then return false end
+    if state.speed < J.STOPPED and state.hold ~= nil then return state.hold end
+    local lib = library_for("GetSimulationNodeParameterAsBool")
+    local read = false
+    for _, ref in ipairs(refs) do
+        local ok, on = pcall(function() return lib:GetSimulationNodeParameterAsBool(state.drivable, ref) end)
+        if ok and type(on) == "boolean" then
+            read = true
+            if on then return true end
+        elseif not state.hold_failed then
+            state.hold_failed = true
+            log("can't read the train's own holding brake: %s", tostring(on))
+        end
+    end
+    if read then return false end
+    return nil
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -336,6 +455,12 @@ local function is_runtime_widget(w)
     return top ~= nil and not top:find("_C$")
 end
 
+-- The game's own text in the box: the objective it has set (it shows it a moment later).
+local function read_game_text(rec)
+    local w = rec.obj
+    rec.game_title, rec.game_line = text_of(w.ObjectiveTitle), text_of(w.ObjectiveDescription)
+end
+
 local function remember_widget(w)
     if not valid(w) then return end
     local cls = class_name(w)
@@ -346,7 +471,7 @@ local function remember_widget(w)
     if not known or not is_runtime_widget(w) then return end
     local key = w:GetAddress()
     if not hud.widgets[key] then
-        hud.widgets[key] = { obj = w }
+        hud.widgets[key] = { obj = w, visible = true }
         log("found the objective box: %s", short_name(w))
     end
 end
@@ -368,34 +493,16 @@ local function search_widgets(now, why)
     log("looked for the objective box (%s): %d found in %.0f ms", why, #widgets(), (os.clock() - started) * 1000)
 end
 
-local wanted, apply -- defined below; the hooks need them
+local NOTHING = {}
 
--- Once the game has its objective box, the moments it writes its own text in it: put ours back straight away.
-local function hook_widgets()
-    if hud.hooks then return end
-    hud.hooks = {}
-    for _, path in ipairs(WIDGET_HOOKS) do
-        local ok = pcall(RegisterHook, path, function(self)
-            hud.hook_calls = hud.hook_calls + 1
-            if not state.on then return end
-            hud.dirty = true
-            local okw, w = pcall(function() return self:get() end)
-            local rec = okw and valid(w) and hud.widgets[w:GetAddress()] or nil
-            if rec then
-                local ok, err = pcall(function()
-                    rec.want = wanted(rec)       -- with the objective the game has just set
-                    apply(rec, true)
-                end)
-                if not ok and not rec.hook_failed then
-                    rec.hook_failed = true
-                    log("can't put the text back as the game writes it: %s", tostring(err))
-                end
-            end
-        end)
-        if ok then hud.hooks[#hud.hooks + 1] = path:match(":(.*)$") .. " (" .. path:match("%.([%w_]+)_C:") .. ")" end
-    end
-    log("watching the objective box for the game's own text: %s",
-        #hud.hooks > 0 and table.concat(hud.hooks, ", ") or "can't, checking it twice a second instead")
+-- What the box should say: {title, colour, line} (nil each: the game's own). From what was read at the last
+-- reading and the game's text kept in `rec`: no game calls.
+local function wanted(rec)
+    if not state.on or not state.aboard then return NOTHING end
+    local info = state.info
+    local take = S.Warnings and T.takeover(info.panel, info, S) or nil
+    if take then return take end
+    return { line = T.normal_line(rec.game_line, info, S) }
 end
 
 local function set_text(tb, s)
@@ -414,24 +521,11 @@ local function original_colour(tb)
     return ok and c or WHITE
 end
 
--- What the box should say now: rec.want = {title, colour, line} (nil each: the game's own).
-wanted = function(rec)
+-- Puts what the box should say into it, writing only what changed. `force`: the game may just have written over it.
+local function apply(rec, force)
+    local want = rec.want or NOTHING
+    if not force and want.title == rec.title and want.colour == rec.colour and want.line == rec.line then return end
     local w = rec.obj
-    local game_title = text_of(w.ObjectiveTitle)
-    local game_line = text_of(w.ObjectiveDescription)
-    rec.game_title, rec.game_line = game_title, game_line
-    if not state.on or not state.aboard then return {} end
-    local judge = state.judge
-    local info = { passengers = state.passengers, score = judge:live_score(),
-                   cost = judge.episode and judge.episode.cost or nil }
-    local take = S.Warnings and T.takeover(judge:panel(), info, S) or nil
-    if take then return take end
-    return { line = T.normal_line(game_line, info, S) }
-end
-
--- Puts what the box should say into it. `force`: the game may just have written over it.
-apply = function(rec, force)
-    local w, want = rec.obj, rec.want or {}
     local name_tb, line_tb = w.Name, w.Description
     if want.title then
         if force or rec.title ~= want.title then
@@ -464,6 +558,36 @@ apply = function(rec, force)
     end
 end
 
+-- Once the game has its objective box, the moments it writes its own text in it: put ours back straight away,
+-- with the objective it has just set.
+local function hook_widgets()
+    if hud.hooks then return end
+    hud.hooks = {}
+    for _, path in ipairs(WIDGET_HOOKS) do
+        local ok = pcall(RegisterHook, path, function(self)
+            hud.hook_calls = hud.hook_calls + 1
+            if not state.on then return end
+            hud.dirty = true
+            local okw, w = pcall(function() return self:get() end)
+            local rec = okw and valid(w) and hud.widgets[w:GetAddress()] or nil
+            if rec and rec.visible then
+                local ok2, err = pcall(function()
+                    read_game_text(rec)
+                    rec.want = wanted(rec)
+                    apply(rec, true)
+                end)
+                if not ok2 and not rec.hook_failed then
+                    rec.hook_failed = true
+                    log("can't put the text back as the game writes it: %s", tostring(err))
+                end
+            end
+        end)
+        if ok then hud.hooks[#hud.hooks + 1] = path:match(":(.*)$") .. " (" .. path:match("%.([%w_]+)_C:") .. ")" end
+    end
+    log("watching the objective box for the game's own text: %s",
+        #hud.hooks > 0 and table.concat(hud.hooks, ", ") or "can't, checking it every 2 s instead")
+end
+
 -- Text without its "·" and "²", which may not come back from the game as they went in.
 local function plain(s)
     return s and s:gsub("[\128-\255]", "") or nil
@@ -482,14 +606,18 @@ local function update_hud(now)
     if check then state.checked_at = now end
     local force = hud.dirty
     hud.dirty = false
-    for _, rec in ipairs(widgets()) do
-        local ok, err = pcall(function()
-            rec.want = wanted(rec)
-            apply(rec, force or (check and overwritten(rec)))
-        end)
-        if not ok and not rec.failed then
-            rec.failed = true
-            log("can't write in the objective box %s: %s", short_name(rec.obj), tostring(err))
+    for _, rec in pairs(hud.widgets) do
+        if rec.visible then
+            local ok, err = pcall(function()
+                rec.want = wanted(rec)
+                local redo = force or (check and (rec.title or rec.line) and overwritten(rec))
+                if redo then read_game_text(rec) end
+                apply(rec, redo)
+            end)
+            if not ok and not rec.failed then
+                rec.failed = true
+                log("can't write in the objective box %s: %s", short_name(rec.obj), tostring(err))
+            end
         end
     end
 end
@@ -505,7 +633,8 @@ local function say(event)
     elseif what == "harsh" then
         log("harsh %s, %.1f m/s²", event[2] == "brake" and "braking" or "acceleration", event[3])
     elseif what == "hold" then
-        log("the train's own holding brake came on at %.2f m/s", event[2])
+        log("the train's own holding brake came on at %.2f m/s; braking over %.2f m/s² from there isn't counted",
+            event[2], event[3])
     end
 end
 
@@ -542,12 +671,19 @@ end
 
 local function feed(now, t)
     state.fed_at = now
+    if t == state.fed_t then return end       -- the game is paused: nothing to judge
     local acc = acceleration()
     if acc == nil then return end
-    state.acc = acc
+    state.fed_t, state.acc = t, acc
     local judge = state.judge
-    for _, event in ipairs(judge:feed(now, state.speed, acc, judged_passengers(), t)) do say(event) end
+    state.hold = holding()
+    for _, event in ipairs(judge:feed(now, state.speed, acc, judged_passengers(), t, nil, false, state.hold)) do
+        say(event)
+    end
     follow_stops(state.speed)
+    local info = state.info
+    info.passengers, info.score, info.panel = state.passengers, judge:live_score(), judge:panel()
+    info.cost = judge.episode and judge.episode.cost or nil
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -557,43 +693,72 @@ local function leave(why)
     if state.aboard then log("not driving: %s", why) end
     state.aboard = false
     state.drivable, state.view, state.stop, state.slow_change = nil, nil, nil, false
-    state.samples = {}
+    state.samples, state.fed_t = {}, nil
     state.judge:lost()
+    state.info = { passengers = nil, score = nil, cost = nil, panel = nil }
 end
 
-local function new_train(drivable, now)
+local function new_train(drivable)
     state.drivable = drivable
-    state.cars, state.passenger_train, state.passengers, state.count_failed = nil, false, nil, false
+    state.cars, state.vehicles, state.passenger_train, state.passengers = nil, nil, false, nil
+    state.count_failed, state.hold_refs, state.hold_failed, state.hold = false, nil, false, nil
     state.counted_at = -math.huge
-    state.samples, state.stop, state.slow_change = {}, nil, false
+    state.samples, state.stop, state.slow_change, state.fed_t = {}, nil, false, nil
     state.judge:lost()
     log("driving %s", short_name(drivable))
+end
+
+local function look_at_train(pc, now)
+    -- the driver still in the same vehicle: nothing to look for
+    local okp, parent = pcall(function() return pc.Pawn:GetAttachParentActor() end)
+    if state.aboard and okp and same(parent, state.view) and valid(state.drivable) then return true end
+    local drivable = find_drivable(pc)
+    if not drivable then
+        leave("no train")
+        return false
+    end
+    local view = find_view(pc)
+    if not view then
+        leave("not aboard your train")
+        return false
+    end
+    if not same(drivable, state.drivable) then new_train(drivable) end
+    state.view, state.aboard = view, true
+    return true
 end
 
 local function look(now)
     state.looked_at = now
     local pc = player_controller(now)
     if not pc then return leave("no player") end
-    local drivable = find_drivable(pc)
-    if not drivable then return leave("no train") end
-    local view = find_view(pc)
-    if not view then return leave("not aboard your train") end
-    if not same(drivable, state.drivable) then new_train(drivable, now) end
-    state.view, state.aboard = view, true
-    local service = service_name(pc) or short_name(drivable)
-    if state.service ~= nil and service ~= state.service then
-        state.judge:new_leg(service, nil, true)  -- another service: its comfort starts afresh
-        log("service %s", service)
+    if not look_at_train(pc, now) then return end
+    local drivable = state.drivable
+
+    if now - state.service_at >= SERVICE_EVERY then
+        state.service_at = now
+        local service = service_name(pc) or short_name(drivable)
+        if state.service ~= nil and service ~= state.service then
+            state.judge:new_leg(service, nil, true)  -- another service: its comfort starts afresh
+            log("service %s", service)
+        end
+        state.service = service
     end
-    state.service = service
     local slow = state.speed < J.MOVING
 
     if state.cars == nil then
         state.cars = find_cars(drivable)
         state.passenger_train = #state.cars > 0
+        state.hold_refs = state.passenger_train and find_hold(drivable) or {}
     end
     if state.passenger_train and (state.counted_at == -math.huge
             or (state.speed < J.STOPPED and now - state.counted_at >= COUNT_EVERY)) then
+        if state.counted_at ~= -math.huge and state.vehicles then
+            local vehicles = formation(drivable)        -- coupled or split at this stop?
+            if vehicles and #vehicles ~= state.vehicles then
+                log("your train is now %d vehicles", #vehicles)
+                state.cars = find_cars(drivable)
+            end
+        end
         local before = state.passengers
         state.counted_at = now
         state.passengers = count_passengers(state.cars)
@@ -602,15 +767,21 @@ local function look(now)
         end
     end
 
-    if #widgets() == 0 and now - hud.searched_at >= REFIND_EVERY * 3 then
+    if next(hud.widgets) == nil and now - hud.searched_at >= REFIND_EVERY * 3 then
         search_widgets(now, hud.notified and "the one the game made has gone" or "the game didn't say it made one")
     end
-    if #widgets() > 0 then hook_widgets() end
-    for _, rec in ipairs(widgets()) do
-        local title = text_of(rec.obj.ObjectiveTitle)
-        if title and title ~= "" and title ~= hud.game_title then
-            if hud.game_title ~= nil and slow then state.slow_change = true end  -- the objective moved on: a station
-            hud.game_title = title
+    local list = widgets()
+    if #list > 0 then hook_widgets() end
+    for _, rec in ipairs(list) do
+        local okv, shown = pcall(function() return rec.obj:IsVisible() end)
+        rec.visible = not okv or shown ~= false
+        if rec.visible then
+            read_game_text(rec)
+            local title = rec.game_title
+            if title and title ~= "" and title ~= hud.game_title then
+                if hud.game_title ~= nil and slow then state.slow_change = true end  -- the objective moved on
+                hud.game_title = title
+            end
         end
     end
 end
@@ -622,12 +793,14 @@ local function debug_line(now)
     if not S.DebugLog or now - state.debug_at < DEBUG_EVERY then return end
     state.debug_at = now
     local work = state.work
-    local panel = state.judge:panel()
+    local panel = state.info.panel
     if state.aboard then
-        log("%.1f m/s, %s, %s, comfort %s, showing %s; the mod's work %.3f ms a frame on average, %.0f ms at most over %d frames",
+        local hold = state.hold_refs and #state.hold_refs > 0
+            and (state.hold and ", holding brake on" or ", holding brake off") or ""
+        log("%.1f m/s, %s, %s%s, comfort %s, showing %s; the mod's work %.3f ms a frame on average, %.0f ms at most over %d frames",
             state.speed, state.acc and string.format("%+.2f m/s²", state.acc) or "acceleration not known yet",
             T.aboard(state.passengers) or (state.passenger_train and "passengers not counted" or "not a passenger train"),
-            state.judge:live_score() and string.format("%.0f", state.judge:live_score()) or "-",
+            hold, state.info.score and string.format("%.0f", state.info.score) or "-",
             panel and panel.phase or "the objective", work.frames > 0 and work.total / work.frames * 1000 or 0,
             work.most * 1000, work.frames)
     end
@@ -636,9 +809,9 @@ end
 
 local function frame()
     local started = os.clock()
-    local now = real_time()
+    local now = started
     if now - state.looked_at >= LOOK_EVERY then look(now) end
-    if state.aboard and valid(state.view) then
+    if state.aboard then
         local t = game_time()
         if t then
             local vel = state.view:GetVelocity()
@@ -646,7 +819,7 @@ local function frame()
             if now - state.fed_at >= FEED_EVERY then feed(now, t) end
         end
     end
-    if hud.dirty or now - (state.hud_at or -math.huge) >= FEED_EVERY then
+    if hud.dirty or now - state.hud_at >= FEED_EVERY then
         state.hud_at = now
         update_hud(now)
     end
@@ -662,6 +835,7 @@ local function on_frame()
     if not ok then
         state.errors = (state.errors or 0) + 1
         if state.errors <= 5 then log("something went wrong: %s", tostring(err)) end
+        state.looked_at = -math.huge             -- look at the train again
     end
 end
 
@@ -698,9 +872,9 @@ local function report_section(title, fn)
 end
 
 -- A game function's parameters, "Name: type" each.
-local function describe_function(fname)
+local function describe_function(name)
     local flags = EObjectFlags and EObjectFlags.RF_NoFlags or 0
-    local found = FindObjects(5, "Function", fname, flags, flags, false) or {}
+    local found = FindObjects(5, "Function", name, flags, flags, false) or {}
     local out = {}
     for _, f in pairs(found) do
         local params = {}
@@ -714,11 +888,8 @@ local function describe_function(fname)
     return #out > 0 and table.concat(out, "; ") or "not found"
 end
 
--- What a call gave: a number, a bool, text, an object, or the error.
-local function try_call(obj, fname, ...)
-    local args = { ... }
-    local ok, r = pcall(function() return obj[fname](obj, table.unpack(args)) end)
-    if not ok then return "error: " .. tostring(r) end
+-- What a value from the game is: a number, a bool, text, an object.
+local function describe(r)
     if type(r) == "number" or type(r) == "boolean" or type(r) == "string" then return tostring(r) end
     if r == nil then return "nothing" end
     if valid(r) then return "object " .. short_name(r) end
@@ -741,27 +912,36 @@ local function report()
     if pc then
         report_section("train", function()
             local d = find_drivable(pc)
-            log("drivable: %s; view: %s; service: %s", short_name(d), short_name(find_view(pc)),
-                tostring(service_name(pc)))
+            local ok, r, out = call_out(pc, "GetDrivenServiceName")
+            log("drivable: %s; view: %s; GetDrivenServiceName: %s", short_name(d), short_name(find_view(pc)),
+                ok and string.format("gave %s, out %s", describe(r), describe(out)) or ("error: " .. tostring(r)))
             if d then
-                log("  GetFormation: %s; GetForwardsVelocity: %s; HUD_GetAcceleration: %s; HUD_GetSpeed: %s",
-                    try_call(d, "GetFormation"), try_call(d, "GetForwardsVelocity"),
-                    try_call(d, "HUD_GetAcceleration"), try_call(d, "HUD_GetSpeed"))
-                local how = membership(d)
-                log("  your train told by: %s", how)
+                local vehicles, why = formation(d)
+                if vehicles then
+                    local names = {}
+                    for _, v in ipairs(vehicles) do
+                        names[#names + 1] = short_name(v) .. (cargo_of(v) and " (passengers)" or "")
+                    end
+                    log("  your train, front to back: %s", table.concat(names, ", "))
+                else
+                    log("  the game won't list your train: %s", tostring(why))
+                end
+                local okv, fv = pcall(function() return d:GetForwardsVelocity() end)
+                log("  GetForwardsVelocity: %s; speed read %.2f m/s, acceleration %s over %d readings",
+                    okv and describe(fv) or "error", state.speed,
+                    state.acc and string.format("%+.3f m/s²", state.acc) or "-", #state.samples)
+                log("  holding brake nodes: %d, now %s", state.hold_refs and #state.hold_refs or 0, tostring(state.hold))
             end
-            log("  speed %.2f m/s, acceleration %s over %d readings", state.speed,
-                state.acc and string.format("%+.3f m/s²", state.acc) or "-", #state.samples)
         end)
     end
     report_section("passengers", function()
-        local cars = state.cars or {}
-        log("passenger cars: %d", #cars)
-        for i, c in ipairs(cars) do
+        for i, c in ipairs(state.cars or {}) do
             local ok, owner = pcall(function() return c:GetOwner() end)
-            log("  %d: %s on %s: %s aboard", i, short_name(c), ok and short_name(owner) or "?",
-                try_call(c, "GetPassengerCount"))
+            local okn, n = pcall(function() return c:GetPassengerCount() end)
+            log("  car %d: %s on %s: %s aboard", i, short_name(c), ok and short_name(owner) or "?",
+                okn and describe(n) or ("error: " .. tostring(n)))
         end
+        log("passenger cars: %d, %s aboard", #(state.cars or {}), tostring(state.passengers))
     end)
     report_section("comfort", function()
         local j = state.judge
@@ -784,7 +964,7 @@ local function report()
                 size = string.format("%.0f x %.0f", d.X, d.Y)
             end)
             log("  %s, %s: name %q, line %q (%s wide x high); the game's: %q / %q", class_name(w),
-                try_call(w, "IsVisible") == "true" and "shown" or "hidden", tostring(text_of(w.Name:GetText())),
+                rec.visible and "shown" or "hidden", tostring(text_of(w.Name:GetText())),
                 tostring(text_of(w.Description:GetText())), size, tostring(text_of(w.ObjectiveTitle)),
                 tostring(text_of(w.ObjectiveDescription)))
         end
@@ -792,11 +972,9 @@ local function report()
             and table.concat(hud.hooks, ", ") or "none", hud.hook_calls)
     end)
     report_section("game functions", function()
-        for _, fname in ipairs({ "GetCurrentLocalDrivableActor", "GetDrivenServiceName", "GetFormation",
-                                 "GetForwardsVelocity", "GetPassengerCount", "AreRailVehiclesInSameFormation",
-                                 "IsConsistPlayerDriven", "HUD_GetAcceleration", "HUD_GetTrainBrakeHandle",
-                                 "GetSimulationNodeParameterAsBool" }) do
-            log("  %s", describe_function(fname))
+        for _, name in ipairs({ "GetCurrentLocalDrivableActor", "GetDrivenServiceName", "GetFormation",
+                                "GetPassengerCount", "IsConsistPlayerDriven", "GetSimulationNodeParameterAsBool" }) do
+            log("  %s", describe_function(name))
         end
     end)
     log("---- end of report (%.0f ms) ----", (os.clock() - started) * 1000)
@@ -834,7 +1012,7 @@ local function switch(on)
     state.on = on
     if on then
         state.judge:lost()
-        state.looked_at, state.samples = -math.huge, {}
+        state.looked_at, state.samples, state.fed_t = -math.huge, {}, nil
         state.loop = start_loop()
         log("on")
     else
@@ -842,7 +1020,7 @@ local function switch(on)
         state.loop = nil
         for _, rec in ipairs(widgets()) do
             pcall(function()
-                rec.want = {}
+                rec.want = NOTHING
                 apply(rec, false)
             end)
         end

@@ -8,6 +8,15 @@ local Sim = { logs = {}, frame_fns = {}, keys = {}, hooks = {}, notify = {}, nex
 
 local function vec(x, y, z) return { X = x, Y = y, Z = z } end
 
+-- Game calls made, by name (UE4SS's own checks, IsValid and the like, aren't calls into the game).
+Sim.calls = {}
+local function call(name) Sim.calls[name] = (Sim.calls[name] or 0) + 1 end
+function Sim.total_calls()
+    local n = 0
+    for _, c in pairs(Sim.calls) do n = n + c end
+    return n
+end
+
 local function object(class, path, fields)
     Sim.next_address = Sim.next_address + 1
     local o = fields or {}
@@ -28,18 +37,24 @@ end
 
 local function invalid() return { IsValid = function() return false end } end
 
--- An FText: UE4SS gives these with ToString.
+-- An FText, FName: UE4SS gives these with ToString.
 local function text(s) return { s = s, ToString = function(self) return self.s end } end
 function FText(s) return text(s) end
+function FName(s) return text(s) end
+local function str(v) return type(v) == "table" and v:ToString() or v end
 
 local function text_block(name, default)
     local tb = object("TextBlock", name, { shown = default,
         ColorAndOpacity = { SpecifiedColor = { R = 1, G = 1, B = 1, A = 1 }, ColorUseRule = 0 } })
     tb.SetText = function(self, t)
+        call("SetText")
         self.shown = t:ToString()
         Sim.set_texts = Sim.set_texts + 1
     end
-    tb.GetText = function(self) return text(self.shown) end
+    tb.GetText = function(self)
+        call("GetText")
+        return text(self.shown)
+    end
     tb.SetColorAndOpacity = function(self, c)
         self.ColorAndOpacity = { SpecifiedColor = c.SpecifiedColor, ColorUseRule = c.ColorUseRule }
     end
@@ -52,28 +67,47 @@ end
 
 local pc, pawn, view, drivable, statics
 
+-- The objective box: its Name and Description text blocks, and the objective the game has set (ObjectiveTitle,
+-- ObjectiveDescription: blueprint variables, each read a call).
 local function new_widget(class, path)
     local w = object(class, path)
     w.Name = text_block(path .. ".WidgetTree.Name", "OBJECTIVE NAME")
     w.Description = text_block(path .. ".WidgetTree.Description", "Description")
-    w.ObjectiveTitle = text("")
-    w.ObjectiveDescription = text("")
-    w.IsVisible = function() return true end
-    return w
+    w.vars = { ObjectiveTitle = text(""), ObjectiveDescription = text("") }
+    w.hidden = false
+    w.IsVisible = function(self)
+        call("IsVisible")
+        return not self.hidden
+    end
+    return setmetatable(w, { __index = function(self, k)
+        local v = rawget(self, "vars")[k]
+        if v ~= nil then call("read " .. k) end
+        return v
+    end })
 end
 
 local function cargo(owner, n)
     local c = object("PassengerCargoModelComponent", owner.path .. ".PassengerCargoModel", { owner = owner, n = n })
     c.GetOwner = function(self) return self.owner end
     c.GetPassengerCount = function(self)
+        call("GetPassengerCount")
         if Sim.count_breaks then error("bad call") end
         return self.n
     end
+    owner.cargo = c
     return c
+end
+
+-- A TArray as UE4SS gives it: ForEach(fn(index, element)), each element with get().
+local function tarray(list)
+    return { ForEach = function(self, fn)
+        for i, v in ipairs(list) do fn(i, { get = function() return v end }) end
+    end }
 end
 
 function Sim.setup(opts)
     opts = opts or {}
+    Sim.calls = {}
     Sim.logs, Sim.frame_fns, Sim.keys, Sim.hooks, Sim.notify = {}, {}, {}, {}, {}
     Sim.time, Sim.wall = 0.0, 100.0          -- game time, and the wall clock (os.clock)
     Sim.v, Sim.acc, Sim.drive = opts.speed or 0.0, 0.0, nil
@@ -83,21 +117,30 @@ function Sim.setup(opts)
     Sim.service = opts.service or "1M56"
 
     local level = "/Game/Routes/Route/Maps/Route.Route:PersistentLevel"
-    local formation = object("TrainFormation", level .. ".TrainFormation_0")
-    local ai_formation = object("TrainFormation", level .. ".TrainFormation_1")
-    local function vehicle(name, f)
-        local rv = object(name, level .. "." .. name .. "_1", { formation = f, kinds = { RailVehicle = true } })
-        rv.GetFormation = function(self)
-            if opts.no_formation then error("no such function") end
-            return self.formation
+    local train, ai_train = {}, {}
+    local function vehicle(name, consist)
+        local rv = object(name, level .. "." .. name .. "_1", { consist = consist, kinds = { RailVehicle = true } })
+        rv.GetFormation = function(self, mode)
+            call("GetFormation")
+            if opts.no_formation or mode ~= 0 then error("bad call") end
+            return tarray(self.consist)
+        end
+        rv.GetComponentByClass = function(self, cls)
+            call("GetComponentByClass")
+            if cls.short == "PassengerCargoModelComponent" and self.cargo then return self.cargo end
+            return invalid()
         end
         rv.GetAttachParentActor = function() return invalid() end
+        table.insert(consist, rv)
         return rv
     end
-    drivable = vehicle("RVM_Class150_DMS", formation)
-    local cars = { drivable, vehicle("RVM_Class150_DMSL", formation) }
-    local loco = vehicle("RVM_Class66", formation)
-    local ai = vehicle("RVM_AI_Class323", ai_formation)
+    drivable = vehicle("RVM_Class150_DMS", train)
+    local cars = { drivable, vehicle("RVM_Class150_DMSL", train) }
+    local loco = vehicle("RVM_Class66", train)
+    local ai = vehicle("RVM_AI_Class323", ai_train)
+    Sim.train = train
+    -- the train's own holding brake, a simulation node that a Class 350 has
+    Sim.hold_node, Sim.hold_on = opts.hold and "DirectBrakeControlPowered" or nil, false
     Sim.cargo = {}
     if opts.passengers ~= false then
         local counts = opts.passengers or { 40, 22 }
@@ -108,20 +151,62 @@ function Sim.setup(opts)
 
     view = object("RVV_Class150_DMS_C", level .. ".RVV_Class150_DMS_C_2", { kinds = { RailVehicleView = true } })
     view.GetAttachParentActor = function() return drivable end
-    view.GetVelocity = function() return vec(Sim.v * 100 * 0.6, Sim.v * 100 * 0.8, 0) end
+    view.GetVelocity = function()
+        call("GetVelocity")
+        return vec(Sim.v * 100 * 0.6, Sim.v * 100 * 0.8, 0)
+    end
     pawn = object("TS2DefaultDriverPawn_C", level .. ".TS2DefaultDriverPawn_C_0")
     pawn.GetAttachParentActor = function()
+        call("GetAttachParentActor")
         if Sim.walked_off then return invalid() end
         return view
     end
+    local world = object("World", level)
     pc = object("TS2PrototypePlayerController_C", level .. ".TS2PrototypePlayerController_C_0", { Pawn = pawn })
-    pc.GetCurrentLocalDrivableActor = function()
-        if Sim.no_drivable then return invalid() end
+    pc.GetWorld = function() return world end
+    pc.GetCurrentLocalDrivableActor = function(self, w)
+        call("GetCurrentLocalDrivableActor")
+        if Sim.no_drivable or w ~= world then return invalid() end
         return drivable
     end
-    pc.GetDrivenServiceName = function() return text(Sim.service) end
+    -- the service's name comes back in its out parameter: UE4SS writes it into the table passed for it
+    pc.GetDrivenServiceName = function(self, out)
+        call("GetDrivenServiceName")
+        if type(out) ~= "table" then error("out parameter missing") end
+        if Sim.service_returned then return true, FName(Sim.service) end
+        out.ServiceName = FName(Sim.service)
+        return true
+    end
     statics = object("GameplayStatics", "/Script/Engine.Default__GameplayStatics")
-    statics.GetTimeSeconds = function() return Sim.time end
+    statics.GetTimeSeconds = function()
+        call("GetTimeSeconds")
+        return Sim.time
+    end
+    -- the game's function library for reading a train's simulation, as its blueprints do
+    Sim.physics = object("PhysicsFunctionLibrary", "/Script/TS2Prototype.Default__PhysicsFunctionLibrary")
+    Sim.physics.DoesSimulationNodeExist = function(self, ctx, node)
+        call("DoesSimulationNodeExist")
+        return ctx == drivable and str(node.ComponentName) == "Simulation" and str(node.NodeName) == Sim.hold_node
+    end
+    Sim.physics.GetSimulationNodeParameterAsBool = function(self, ctx, p)
+        call("GetSimulationNodeParameterAsBool")
+        local node = p.NodeReference
+        if ctx ~= drivable or str(node.ComponentName) ~= "Simulation" or str(node.NodeName) ~= Sim.hold_node
+            or str(p.ParameterReference.Name) ~= "BrakeHoldActive" or p.ParameterReference.PinIndex ~= -1 then
+            return false
+        end
+        return Sim.hold_on
+    end
+    Sim.player_trains = opts.player_trains   -- IsConsistPlayerDriven in the gameplay library
+    Sim.gameplay = object("TS2GameplayFunctionLibrary", "/Script/TS2Prototype.Default__TS2GameplayFunctionLibrary")
+    Sim.gameplay.IsConsistPlayerDriven = function(self, actor, out)
+        call("IsConsistPlayerDriven")
+        if type(out) ~= "table" then error("out parameter missing") end
+        for _, v in ipairs(train) do
+            if v == actor then return true end
+        end
+        return false
+    end
     Sim.pc = pc
 
     -- the HUD: the objective box on screen, and the templates in the HUD blueprint the game made it from
@@ -135,7 +220,7 @@ end
 -- The game showing an objective, as its HUD does: SetObjective, then ShowObjective (Name and Description written).
 function Sim.objective(title, line)
     local w = Sim.widget
-    w.ObjectiveTitle, w.ObjectiveDescription = text(title), text(line)
+    w.vars.ObjectiveTitle, w.vars.ObjectiveDescription = text(title), text(line)
     w.Name.shown, w.Description.shown = title, line
     Sim.call_hooks("ShowObjective", w)
 end
@@ -143,7 +228,7 @@ end
 -- The game rewriting the objective's text (UpdateObjectiveText), with or without telling the hooks.
 function Sim.objective_text(title, line, quietly)
     local w = Sim.widget
-    w.ObjectiveTitle, w.ObjectiveDescription = text(title), text(line)
+    w.vars.ObjectiveTitle, w.vars.ObjectiveDescription = text(title), text(line)
     w.Name.shown, w.Description.shown = title, line
     if not quietly then Sim.call_hooks("UpdateObjectiveText", w) end
 end
@@ -217,8 +302,21 @@ function FindAllOf(name)
 end
 function FindObjects() return {} end
 function StaticFindObject(path)
-    if path == "/Script/TS2Prototype.RailVehicleView" then return object("Class", path, { short = "RailVehicleView" }) end
-    if path == "/Script/TS2Prototype.RailVehicle" then return object("Class", path, { short = "RailVehicle" }) end
+    local cls = path:match("^/Script/TS2Prototype%.([%w_]+)$")
+    if cls == "RailVehicleView" or cls == "RailVehicle" or cls == "PassengerCargoModelComponent" then
+        return object("Class", path, { short = cls })
+    end
+    if path == "/Script/TS2Prototype.Default__PhysicsFunctionLibrary" then return Sim.physics end
+    if path == "/Script/TS2Prototype.PhysicsFunctionLibrary:GetSimulationNodeParameterAsBool"
+        or path == "/Script/TS2Prototype.PhysicsFunctionLibrary:DoesSimulationNodeExist" then
+        return object("Function", path)
+    end
+    if Sim.player_trains then
+        if path == "/Script/TS2Prototype.Default__TS2GameplayFunctionLibrary" then return Sim.gameplay end
+        if path == "/Script/TS2Prototype.TS2GameplayFunctionLibrary:IsConsistPlayerDriven" then
+            return object("Function", path)
+        end
+    end
     return invalid()
 end
 

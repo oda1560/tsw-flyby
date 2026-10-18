@@ -35,6 +35,7 @@ class ComfortHUD(unittest.TestCase):
         self.lua = lua54.LuaRuntime(unpack_returned_tuples=True)
         self.lua.execute(f'package.path = "{SCRIPTS}/?.lua;{TESTS}/?.lua;" .. package.path')
         self.sim = self.lua.eval('(require("fake_comfort_game"))')
+        self.lua.globals().Sim = self.sim
         sim = {k: self.lua.table_from(v) if isinstance(v, list) else v for k, v in sim.items()}
         self.sim.setup(self.lua.table_from(sim))
         s = self.lua.eval('(require("comfort_settings"))')
@@ -48,6 +49,9 @@ class ComfortHUD(unittest.TestCase):
 
     def logs(self):
         return self.sim.all_logs()
+
+    def clear_calls(self):
+        self.lua.execute("for k in pairs(Sim.calls) do Sim.calls[k] = nil end")
 
     def shown(self):
         return tuple(self.sim.shown())
@@ -98,7 +102,8 @@ class ComfortHUD(unittest.TestCase):
         self.start(passengers=[10, 5])
         self.run_at(2)
         self.assertIn("15 aboard", self.shown()[1])
-        self.assertIn("2 passenger cars on your train of 3 in the world (same formation)", self.logs())
+        self.assertIn("2 passenger cars on your train (the game's list of your train, 3 vehicles)", self.logs())
+        self.assertEqual(self.sim.searched("PassengerCargoModelComponent"), 0)
 
     def test_comfort_once_the_first_ride_has_begun(self):
         self.start()
@@ -194,7 +199,7 @@ class ComfortHUD(unittest.TestCase):
         self.run_at(6)
         self.assertIn("comfort 9", self.shown()[1])
         self.sim.service = "2W09"
-        self.run_at(2)
+        self.run_at(6)
         self.assertIn("service 2W09", self.logs())
         self.assertTrue(self.shown()[1].endswith("comfort 100"), self.shown())    # the ride going on, on 2W09
 
@@ -205,13 +210,84 @@ class ComfortHUD(unittest.TestCase):
         self.drive_off()
         self.run_at(2, -1.4)
         self.assertEqual(self.shown(), ("DRIVE TO SHIPLEY", "Arrive by 19:12:00"))
-        self.assertIn("0 passenger cars on your train of 1 in the world", self.logs())
+        self.assertIn("0 passenger cars on your train (the game's list of your train, 3 vehicles)", self.logs())
 
     def test_without_the_formation_only_the_car_you_drive(self):
         self.start(no_formation=True)
         self.run_at(2)
         self.assertIn("40 aboard", self.shown()[1])
-        self.assertIn("only the vehicle you drive", self.logs())
+        self.assertIn("only the vehicle you drive, of 3 in the world", self.logs())
+
+    def test_without_the_formation_the_player_s_trains(self):
+        self.start(no_formation=True, player_trains=True)
+        self.run_at(2)
+        self.assertIn("62 aboard", self.shown()[1])
+        self.assertIn("the player's trains, of 3 in the world", self.logs())
+
+    def test_coupled_at_a_stop(self):
+        self.start()
+        self.run_at(2)
+        self.lua.execute('''
+            local first = Sim.train[1]
+            local extra = { valid = true, address = 9999, class = "RVM_Class150_DMS", path = "x.RVM_Class150_DMS_9",
+                            IsValid = function(self) return self.valid end, GetAddress = function(self) return 9999 end,
+                            GetFullName = function(self) return self.class .. " " .. self.path end,
+                            GetComponentByClass = first.GetComponentByClass, GetFormation = first.GetFormation,
+                            consist = Sim.train }
+            extra.cargo = { valid = true, IsValid = function() return true end, GetOwner = function() return extra end,
+                            GetPassengerCount = function() return 30 end }
+            table.insert(Sim.train, extra)
+        ''')
+        self.run_at(6)
+        self.assertIn("your train is now 4 vehicles", self.logs())
+        self.assertIn("92 aboard", self.shown()[1])
+
+    def test_service_name_given_back_either_way(self):
+        for returned in (False, True):
+            self.start(service="2W09")
+            self.sim.service_returned = returned
+            self.drive_off(to=8.0)
+            self.stop(0.7, ease_below=2.5, eased=0.3)
+            self.sim.objective("LOAD PASSENGERS", "Wait until 19:12:30")
+            self.run_at(3)
+            self.drive_off()
+            self.assertIn("2W09 so far 100 over 1 ride", self.logs())
+
+    # ---- the train's own holding brake (a Class 350's comes on at 0.62 m/s, braking it 0.9-1.0 m/s²)
+
+    def held_stop(self, hold):
+        self.start(hold=hold)
+        self.drive_off(to=8.0)
+
+        def drive(t, v):
+            if v <= 0:
+                return 0.0
+            self.sim.hold_on = hold and v < 0.62
+            if v < 0.62:
+                return -0.95           # the train's own brake, whatever the handle says
+            return -(0.7 if v > 2.5 else 0.37)
+        self.sim.drive = drive
+        self.sim.run(30)
+        self.sim.drive = None
+        return self.logs()
+
+    def test_the_holding_brake_isn_t_a_jolt(self):
+        logs = self.held_stop(True)
+        self.assertIn("the train's own holding brake: DirectBrakeControlPowered", logs)
+        self.assertIn("the train's own holding brake came on at 0.", logs)
+        self.assertIn("smooth stop", logs)
+
+    def test_without_it_the_same_stop_is_a_jolt(self):
+        logs = self.held_stop(False)
+        self.assertIn("the train's own holding brake: none", logs)
+        self.assertIn("jolt on stopping", logs)
+
+    def test_holding_brake_only_read_when_slow(self):
+        self.start(hold=True)
+        self.drive_off()
+        self.clear_calls()
+        self.run_at(10)
+        self.assertEqual(self.sim.calls["GetSimulationNodeParameterAsBool"] or 0, 0)
 
     def test_passengers_that_can_t_be_counted_still_judged(self):
         self.start()
@@ -265,8 +341,41 @@ class ComfortHUD(unittest.TestCase):
         self.drive_off()
         self.run_at(60)
         self.assertEqual(self.sim.pc_searches, 1)
-        self.assertEqual(self.sim.searched("PassengerCargoModelComponent"), 1)
+        self.assertEqual(self.sim.searched("PassengerCargoModelComponent"), 0)
         self.assertEqual(self.sim.searched("HUDObjectiveWidget_Minimal_C"), 0)
+
+    def test_few_game_calls_while_driving(self):
+        """Driving along with nothing happening: the time and the velocity each frame, and only a few calls a second
+        besides (the driver still aboard, whether the box is shown and the game's objective)."""
+        self.start()
+        self.drive_off()
+        self.clear_calls()
+        self.run_at(10)
+        calls = {k: v for k, v in self.sim.calls.items()}
+        self.assertEqual(calls.pop("GetTimeSeconds"), 600)
+        self.assertEqual(calls.pop("GetVelocity"), 600)
+        self.assertLessEqual(sum(calls.values()), 60, calls)
+        self.assertNotIn("SetText", calls)
+
+    def test_the_hidden_box_left_alone(self):
+        self.start()
+        self.run_at(2)
+        self.sim.widget.hidden = True
+        self.run_at(2)
+        self.clear_calls()
+        self.sim.objective_text("LOAD PASSENGERS", "Wait until 19:07:00", True)
+        self.run_at(5)
+        self.assertNotIn("SetText", self.sim.calls)
+
+    def test_paused_while_braking_costs_nothing_more(self):
+        self.start()
+        self.drive_off()
+        self.run_at(1.0, -1.0)
+        self.sim.paused = True
+        self.run_at(10, -1.0)
+        self.sim.paused = False
+        self.run_at(6, -0.3)
+        self.assertIn("comfort 99", self.shown()[1])
 
     def test_text_written_only_when_it_changes(self):
         self.start()

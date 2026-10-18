@@ -53,23 +53,24 @@ The settings are in `ComfortHUD\Scripts\comfort_settings.lua`. Edit the copy her
 
 ## Framerate
 
-The mod draws nothing of its own. It changes the text in the game's own objective box, and only when the words change, at most 15 times a second. It reads the train's speed and the game's time from inside the game, two calls a frame. There are no windows over the game and no requests to the game's web API, the two things most likely to have slowed the game down with tsw-joystick.
+The mod draws nothing of its own. It changes the text in the game's own objective box, and only when the words change. Each frame it asks the game two things, the time and the train's velocity. Besides that it makes about six calls a second: whether you're still aboard, whether the box is shown, and the game's objective. While stopped it also counts the passengers every 5 s. Working out the comfort and the box's words is the mod's own arithmetic, with no calls into the game. There are no windows over the game and no requests to the game's web API, the two things most likely to have slowed the game down with tsw-joystick.
 
-Searching through all the game's objects takes milliseconds, so the mod only does that when something changes: once when a drive loads, and once for each train you drive. It never searches on a timer while you drive. The F11 report does search, so the game may stutter for a moment when you press it.
+Searching through all the game's objects takes milliseconds, so the mod only does that once, to find the player when a drive loads. Your train's cars come from the game's own list of your train, without a search. The F11 report does search, so the game may stutter for a moment when you press it.
 
 To see what it costs, look at the `[Comfort]` lines every 5 seconds in `UE4SS.log`. Each one ends with how long the mod's work took, on average per frame and at most. The clock it uses counts in whole milliseconds, so the average comes from many frames and the most is either 0 or 1 ms. To compare framerates, press **=** to switch the mod off completely and **=** again to switch it back on.
 
 ## How it works
 
 - **Speed:** read every frame from the vehicle you're in, with the game's own time. The acceleration is the change of speed over the last 0.3 s of game time, so it doesn't stretch when the game runs slowly.
-- **Passengers:** counted from each passenger car of your train (its `PassengerCargoModel`), when you get into the train and every 5 s while stopped. Cars of other trains, AI ones included, aren't counted.
+- **Passengers:** the game lists the vehicles of your train (`GetFormation`), and each one with passengers has a `PassengerCargoModel` the mod counts. It counts when you get into the train and every 5 s while stopped, and notices if the train is coupled or split at a stop. Cars of other trains, AI ones included, aren't counted.
+- **The train's own holding brake:** read from the train's simulation the way the game's own blueprints read it (`DirectBrakeControlPowered.BrakeHoldActive` and the like, as tsw-joystick reads them). From when it comes on as the train stops, braking harder than just before isn't counted, so a Class 350's stops aren't all jolts. It's only read while the train is coming to a stop or moving off.
 - **Stations:** a stop counts as a station when, as the train comes in or while it stands, the game moves the objective on or the passengers change. Leaving a station ends the ride to it. A stop at a signal doesn't end the ride: a jolt there counts towards the ride it's on.
 - **The objective box:** the mod writes into the game's own objective box, in both the full and the minimal HUD. When the game writes its own text there, for a new objective or a new time, the mod puts its text back straight away.
 
 ## Differences from tsw-joystick
 
 - **Brake timing:** the ease-off warning allows 3 s for the brake to release on every train. tsw-joystick times each train's brake.
-- **Holding brakes:** a train's own holding brake isn't recognised yet. tsw-joystick ignores the Class 350's holding brake, which comes on by itself at 0.62 m/s, and does the same for the 331, 333 and 380. Here, stops on those trains may show as jolts however gently you stop.
+- **Holding brakes:** recognised as in tsw-joystick, but not yet seen working in the game. If stops on a Class 350, 331, 333 or 380 all show as jolts however gently you stop, look for `the train's own holding brake` in the log.
 - **Saves:** the comfort so far is lost when you quit the game or load a save. tsw-joystick keeps it with the game's saves.
 - **Without an objective:** in free roam, or whenever the game hides the objective box, nothing is shown.
 
@@ -78,11 +79,11 @@ To see what it costs, look at the `[Comfort]` lines every 5 seconds in `UE4SS.lo
 Everything the mod does is written to `ue4ss\UE4SS.log` in the game's Win64 folder, on lines starting `[Comfort]`:
 
 - **Loading a drive:** whether it found the objective box and could watch it for the game's text.
-- **Getting into a train:** which train, how many passenger cars it found in your train out of how many in the world, and how it told your train from the others.
+- **Getting into a train:** which train, how many passenger cars it found in it and how (the game's list of your train is the one expected), and whether the train has its own holding brake.
 - **Stops:** smooth or jolt and how hard, and the mark of each ride when you leave a station.
 - **Every 5 seconds while driving:** speed, acceleration, passengers, comfort, what the box is showing, and how long the mod's work took.
 
-Pressing **F11** adds a report: the train and what the game's functions give for it, each passenger car and its count, the comfort so far, what the objective box says and how big it is, and the game functions the mod uses with their parameters.
+Pressing **F11** adds a report: your train front to back and which vehicles carry passengers, the service's name as the game gives it, each passenger car and its count, the holding brake, the comfort so far, what the objective box says and how big it is, and the game functions the mod uses with their parameters.
 
 **Nothing changes in the objective box:**
 - Look for `[Comfort] loaded` in the log. If it's missing, UE4SS didn't load the mod.
@@ -90,24 +91,28 @@ Pressing **F11** adds a report: the train and what the game's functions give for
 
 **No passenger numbers:**
 - Look for `passenger cars on your train`.
-- A line saying `only the vehicle you drive` means the mod couldn't tell which cars are yours.
+- A line saying `only the vehicle you drive` means the game wouldn't list your train, and the reason follows. Only the vehicle you drive is counted then.
 - A line saying `can't count the passengers` means the count couldn't be read. Comfort is still judged then.
 
 **The line runs onto two lines:** the minimal HUD wraps its second line at about 40 characters. Turn off **ShowPassengers** or **ShowComfort**.
 
 ## What's been seen in the game
 
-Nothing yet: it was built and tested on 2026-10-18 against a stand-in for the game, not in a drive.
+It was built from the game's own files: the objective box's layout and logic (it's `HUDObjectiveWidget_Minimal` on the minimal HUD), and the game functions it calls. Their parameters were read from the game's reflection tables in `TrainSimWorld.exe`.
 
-It was built from the game's own files: the objective box's layout and logic (it's `HUDObjectiveWidget_Minimal` on the minimal HUD), and the names of the game functions for the train, its formation and its passengers. On the first drive, check:
+**First drive, 2026-10-18 (TfW Class 150, from a station stop to about 18 m/s):**
+- The mod loaded. The game said when it made both objective boxes, so no search was needed, and the mod hooked the game's writing in them.
+- It found the train, read 0.5 m/s² pulling away and showed comfort 100 once moving.
+- The game ran at about 30 fps. The mod's work averaged 0.1–0.3 ms a frame.
+- It couldn't tell which cars were yours, so it counted only the car you drove: 50 aboard, then 17–22 after the stop. The game functions had been called without the parameters they take. Since fixed: the cars now come from the game's list of your train, and the service's name and the holding brake are read with the right parameters. The work each frame was cut down too: the box's words are worked out without asking the game, and the hidden box (the full HUD's, under the minimal one) is left alone.
 
-- **Objective box:** whether it's found, and whether the passengers and comfort appear after the objective.
-- **Characters:** whether "·" and "²" look right.
-- **Length:** whether the second line fits on one line.
-- **Your train's cars:** how the mod told them apart (`same formation` is the one expected), and whether the passenger count matches the game's.
-- **The game's text:** whether the mod puts its text back when the game writes its own, with no flicker.
-- **Warnings:** whether they come at the right moments, compared with tsw-joystick's if you have it.
-- **Cost:** the time the mod's work takes, in the 5-second lines.
+**Still to see in the game:**
+- the passenger count for the whole train, against the game's own
+- the service's name: whether the game gives it back as the mod expects
+- whether "·" and "²" look right, and the second line fits on one line
+- the warnings and how stops are judged, compared with tsw-joystick's if you have it
+- a Class 350's holding brake
+- the mod's work each frame since it was cut down
 
 ## For working on it
 
