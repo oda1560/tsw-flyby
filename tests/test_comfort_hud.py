@@ -109,7 +109,27 @@ class ComfortHUD(unittest.TestCase):
         self.start(passengers=[10, 5])
         self.run_at(2)
         self.assertIn("15 aboard", self.shown()[1])
-        self.assertIn("2 passenger cars on your train (the game's list of your train, 3 vehicles)", self.logs())
+        self.assertIn("2 passenger cars on your train (the game's list of your train, 3 vehicles: GetFormation of its RailVehiclePhysicsComponent)", self.logs())
+        self.assertEqual(self.sim.searched("PassengerCargoModelComponent"), 0)
+
+    def test_the_whole_train_when_you_drive_from_the_back(self):
+        """The train's list front to back (2), not from the vehicle you drive to the back (0)."""
+        self.start(drive_from_back=True)
+        self.run_at(2)
+        self.assertIn("62 aboard", self.shown()[1])
+        self.assertIn("2 passenger cars on your train (the game's list of your train, 3 vehicles: GetFormation of its RailVehiclePhysicsComponent)", self.logs())
+
+    def test_the_rail_vehicle_itself_can_t_list_its_train(self):
+        """As in the game (Class 375, 2026-10-18): the actor you drive has no GetFormation, its component has."""
+        self.start()
+        err = self.lua.eval('select(2, pcall(function() return Sim.drivable:GetFormation(2) end))')
+        self.assertIn("attempt to call a TrivialObject value (method 'GetFormation')", err)
+
+    def test_the_train_s_list_from_a_component_found_by_class(self):
+        self.start(vehicle_component="by class")
+        self.run_at(2)
+        self.assertIn("62 aboard", self.shown()[1])
+        self.assertIn("3 vehicles: GetFormation of its RailVehicleComponent, found by class)", self.logs())
         self.assertEqual(self.sim.searched("PassengerCargoModelComponent"), 0)
 
     def test_comfort_once_the_first_ride_has_begun(self):
@@ -431,7 +451,7 @@ class ComfortHUD(unittest.TestCase):
         self.drive_off()
         self.run_at(2, -1.4)
         self.assertEqual(self.shown(), ("DRIVE TO SHIPLEY", "Arrive by 19:12:00"))
-        self.assertIn("0 passenger cars on your train (the game's list of your train, 3 vehicles)", self.logs())
+        self.assertIn("0 passenger cars on your train (the game's list of your train, 3 vehicles: GetFormation of its RailVehiclePhysicsComponent)", self.logs())
 
     def test_without_the_formation_only_the_car_you_drive(self):
         self.start(no_formation=True)
@@ -445,20 +465,17 @@ class ComfortHUD(unittest.TestCase):
         self.assertIn("62 aboard", self.shown()[1])
         self.assertIn("the player's trains, of 3 in the world", self.logs())
 
+    def test_without_a_rail_vehicle_component_the_player_s_trains(self):
+        self.start(vehicle_component="none", player_trains=True)
+        self.run_at(2)
+        self.assertIn("62 aboard", self.shown()[1])
+        self.assertIn("the game wouldn't list your train (RVM_Class150_DMS has no RailVehicleComponent)", self.logs())
+        self.assertEqual(self.sim.searched("PassengerCargoModelComponent"), 1)
+
     def test_coupled_at_a_stop(self):
         self.start()
         self.run_at(2)
-        self.lua.execute('''
-            local first = Sim.train[1]
-            local extra = { valid = true, address = 9999, class = "RVM_Class150_DMS", path = "x.RVM_Class150_DMS_9",
-                            IsValid = function(self) return self.valid end, GetAddress = function(self) return 9999 end,
-                            GetFullName = function(self) return self.class .. " " .. self.path end,
-                            GetComponentByClass = first.GetComponentByClass, GetFormation = first.GetFormation,
-                            consist = Sim.train }
-            extra.cargo = { valid = true, IsValid = function() return true end, GetOwner = function() return extra end,
-                            GetPassengerCount = function() return 30 end }
-            table.insert(Sim.train, extra)
-        ''')
+        self.sim.couple("RVM_Class150_DMS", 30)
         self.run_at(6)
         self.assertIn("your train is now 4 vehicles", self.logs())
         self.assertIn("92 aboard", self.shown()[1])
@@ -632,6 +649,11 @@ class ComfortHUD(unittest.TestCase):
         self.assertNotIn("(train:", self.logs())
         self.assertIn("passenger cars: 2", self.logs())
         self.assertIn("HUDObjectiveWidget_Minimal_C, shown", self.logs())
+        self.assertIn("drivable's class RVM_Class150_DMS, a RailVehicle; its RailVehicleComponent: "
+                      "RailVehiclePhysicsComponent0 (RailVehicleComponent, its RailVehiclePhysicsComponent)", self.logs())
+        self.assertIn("your train, front to back (GetFormation of its RailVehiclePhysicsComponent): "
+                      "RVM_Class150_DMS_1 (passengers), RVM_Class150_DMSL_1 (passengers), RVM_Class66_1", self.logs())
+        self.assertIn("GetForwardsVelocity: 20.0", self.logs())
 
     def test_report_on_the_saves(self):
         self.with_saves()

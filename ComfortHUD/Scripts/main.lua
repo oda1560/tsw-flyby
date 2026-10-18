@@ -16,7 +16,8 @@
 -- milliseconds, so they're only made when something changes (a drive loading), never on a timer.
 --
 -- The game functions it calls, and their parameters, were read from the game's own reflection tables in
--- TrainSimWorld.exe: RailVehicle GetFormation(EActorConnectionIterationMode) -> the vehicles of the train;
+-- TrainSimWorld.exe: RailVehicleComponent GetFormation(EActorConnectionIterationMode) -> the vehicles of the train
+-- (a rail vehicle has its RailVehicleComponent as RailVehiclePhysicsComponent; the actor has no GetFormation);
 -- PassengerCargoModelComponent GetPassengerCount() -> int; PlayerController GetDrivenServiceName(out FName);
 -- PhysicsFunctionLibrary GetSimulationNodeParameterAsBool(context, {{component, node}, {pin, name}}), the way the
 -- game's own blueprints read a train's simulation (pin -1, by name); TS2GameplayFunctionLibrary GetDateTime(context,
@@ -57,7 +58,8 @@ local STOPPING_SECONDS = 10.0   -- ... once the stop going on as it was made has
 local PENDING_SECONDS = 60.0    -- a save the drive doesn't come to the time of in this long isn't kept with it
 local MAX_CARS = 16
 local WHITE = { R = 1.0, G = 1.0, B = 1.0, A = 1.0 }
-local FRONT_TO_BACK = 0         -- EActorConnectionIterationMode::FrontToBack: GetFormation's whole train
+local FRONT_TO_BACK = 2         -- EActorConnectionIterationMode::FrontToBack: GetFormation's whole train (0 and 1
+                                -- are InitialToBack and InitialToFront, from the vehicle asked; 3 BackToFront)
 
 local OBJECTIVE_CLASS = "/Script/TS2Prototype.TS2HUDObjectiveWidget"
 local WIDGET_CLASSES = { "HUDObjectiveWidget_C", "HUDObjectiveWidget_Minimal_C" } -- the full and the minimal HUD
@@ -290,10 +292,30 @@ local function service_name(pc)
     return s
 end
 
--- The vehicles of your train, front to back (the game's GetFormation). nil and why if it won't say.
+-- The drivable's RailVehicleComponent, the part of a rail vehicle that knows its train: the rail vehicle's own
+-- RailVehiclePhysicsComponent, or else the first of that class on it. The component and how it was found, or nil
+-- and why.
+local function vehicle_component(drivable)
+    local ok, c = pcall(function() return drivable.RailVehiclePhysicsComponent end)
+    if ok and valid(c) then return c, "its RailVehiclePhysicsComponent" end
+    local cls = class("/Script/TS2Prototype.RailVehicleComponent")
+    if valid(cls) then
+        local ok2, c2 = pcall(function() return drivable:GetComponentByClass(cls) end)
+        if ok2 and valid(c2) then return c2, "its RailVehicleComponent, found by class" end
+    end
+    return nil, string.format("%s has no RailVehicleComponent%s", class_name(drivable),
+        is_a(drivable, class("/Script/TS2Prototype.RailVehicle")) and "" or " and isn't a RailVehicle")
+end
+
+-- The vehicles of your train, front to back (the game's GetFormation) and how they were listed. nil and why if it
+-- won't say.
 local function formation(drivable)
-    local ok, arr = pcall(function() return drivable:GetFormation(FRONT_TO_BACK) end)
-    if not ok or arr == nil then return nil, ok and "it gave nothing" or tostring(arr) end
+    local comp, how = vehicle_component(drivable)
+    if not comp then return nil, how end
+    local ok, arr = pcall(function() return comp:GetFormation(FRONT_TO_BACK) end)
+    if not ok or arr == nil then
+        return nil, string.format("GetFormation of %s: %s", how, ok and "it gave nothing" or tostring(arr))
+    end
     local list, mine = {}, false
     local me = drivable:GetAddress()
     local ok2, err = pcall(each_in, arr, function(v)
@@ -302,9 +324,11 @@ local function formation(drivable)
             if v:GetAddress() == me then mine = true end
         end
     end)
-    if not ok2 then return nil, tostring(err) end
-    if not mine then return nil, string.format("its %d vehicles left out the one you drive", #list) end
-    return list
+    if not ok2 then return nil, string.format("GetFormation of %s: %s", how, tostring(err)) end
+    if not mine then
+        return nil, string.format("GetFormation of %s: its %d vehicles left out the one you drive", how, #list)
+    end
+    return list, "GetFormation of " .. how
 end
 
 local function cargo_of(vehicle)
@@ -320,19 +344,20 @@ end
 -- are on the player's train, or else only the one you drive.
 local function find_cars(drivable, quiet)
     local started = os.clock()
-    local vehicles, why = formation(drivable)
+    local vehicles, listed = formation(drivable)     -- how the game listed them, or why it wouldn't
     local cars, how = {}, nil
     if vehicles then
         for _, v in ipairs(vehicles) do
             local c = cargo_of(v)
             if c and #cars < MAX_CARS then cars[#cars + 1] = c end
         end
-        how = string.format("the game's list of your train, %d vehicle%s", #vehicles, #vehicles == 1 and "" or "s")
+        how = string.format("the game's list of your train, %d vehicle%s: %s", #vehicles, #vehicles == 1 and "" or "s",
+            listed)
     else
         local all = FindAllOf("PassengerCargoModelComponent") or {}
         local mine = function(o) return same(o, drivable) end
         how = string.format("only the vehicle you drive, of %d in the world: the game wouldn't list your train (%s)",
-            #all, why)
+            #all, listed)
         local lib = library_for("IsConsistPlayerDriven")
         if lib then
             local ok, yes = call_out(lib, "IsConsistPlayerDriven", drivable)
@@ -342,7 +367,7 @@ local function find_cars(drivable, quiet)
                     return ok2 and y == true
                 end
                 how = string.format("the player's trains, of %d in the world: the game wouldn't list your train (%s)",
-                    #all, why)
+                    #all, listed)
             end
         end
         for _, c in ipairs(all) do
@@ -1162,17 +1187,21 @@ local function report()
             log("drivable: %s; view: %s; GetDrivenServiceName: %s", short_name(d), short_name(find_view(pc)),
                 ok and string.format("gave %s, out %s", describe(r), describe(out)) or ("error: " .. tostring(r)))
             if d then
-                local vehicles, why = formation(d)
+                local comp, found = vehicle_component(d)
+                log("  drivable's class %s, %s; its RailVehicleComponent: %s", class_name(d),
+                    is_a(d, class("/Script/TS2Prototype.RailVehicle")) and "a RailVehicle" or "not a RailVehicle",
+                    comp and string.format("%s (%s, %s)", short_name(comp), class_name(comp), found) or found)
+                local vehicles, listed = formation(d)
                 if vehicles then
                     local names = {}
                     for _, v in ipairs(vehicles) do
                         names[#names + 1] = short_name(v) .. (cargo_of(v) and " (passengers)" or "")
                     end
-                    log("  your train, front to back: %s", table.concat(names, ", "))
+                    log("  your train, front to back (%s): %s", listed, table.concat(names, ", "))
                 else
-                    log("  the game won't list your train: %s", tostring(why))
+                    log("  the game won't list your train: %s", tostring(listed))
                 end
-                local okv, fv = pcall(function() return d:GetForwardsVelocity() end)
+                local okv, fv = pcall(function() return comp:GetForwardsVelocity() end)
                 log("  GetForwardsVelocity: %s; speed read %.2f m/s, acceleration %s over %d readings",
                     okv and describe(fv) or "error", state.speed,
                     state.acc and string.format("%+.3f m/s²", state.acc) or "-", #state.samples)

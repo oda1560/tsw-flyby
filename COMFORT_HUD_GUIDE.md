@@ -69,7 +69,7 @@ To see what it costs, look at the `[Comfort]` lines every 5 seconds in `UE4SS.lo
 ## How it works
 
 - **Speed:** read every frame from the vehicle you're in, with the game's own time. The acceleration is the change of speed over the last 0.3 s of game time, so it doesn't stretch when the game runs slowly.
-- **Passengers:** the game lists the vehicles of your train (`GetFormation`), and each one with passengers has a `PassengerCargoModel` the mod counts. It counts when you get into the train and every 5 s while stopped, and notices if the train is coupled or split at a stop. Cars of other trains, AI ones included, aren't counted.
+- **Passengers:** the game lists the vehicles of your train, front to back (`GetFormation` of the vehicle's `RailVehiclePhysicsComponent`), and each one with passengers has a `PassengerCargoModel` the mod counts. It counts when you get into the train and every 5 s while stopped, and notices if the train is coupled or split at a stop. Cars of other trains, AI ones included, aren't counted.
 - **The train's own holding brake:** read from the train's simulation the way the game's own blueprints read it (`DirectBrakeControlPowered.BrakeHoldActive` and the like, as tsw-joystick reads them). From when it comes on as the train stops, braking harder than just before isn't counted, so a Class 350's stops aren't all jolts. It's only read while the train is coming to a stop or moving off.
 - **Stations:** a stop counts as a station when, as the train comes in or while it stands, the game moves the objective on or the passengers change. Leaving a station ends the ride to it. A stop at a signal doesn't end the ride: a jolt there counts towards the ride it's on.
 - **The objective box:** the mod writes into the game's own objective box, in both the full and the minimal HUD. When the game writes its own text there, for a new objective or a new time, the mod puts its text back straight away.
@@ -87,7 +87,7 @@ To see what it costs, look at the `[Comfort]` lines every 5 seconds in `UE4SS.lo
 Everything the mod does is written to `ue4ss\UE4SS.log` in the game's Win64 folder, on lines starting `[Comfort]`:
 
 - **Loading a drive:** whether it found the objective box and could watch it for the game's text.
-- **Getting into a train:** which train, how many passenger cars it found in it and how (the game's list of your train is the one expected), and whether the train has its own holding brake.
+- **Getting into a train:** which train, how many passenger cars it found in it and how, and whether the train has its own holding brake. The expected way is `the game's list of your train, N vehicles: GetFormation of its RailVehiclePhysicsComponent`.
 - **Stops:** smooth or jolt and how hard, and the mark of each ride when you leave a station.
 - **Every 5 seconds while driving:** speed, acceleration, passengers, comfort, what the box is showing, and how long the mod's work took.
 - **Saves:**
@@ -96,7 +96,7 @@ Everything the mod does is written to `ue4ss\UE4SS.log` in the game's Win64 fold
   - `kept with the game's checkpoint` (or `save`) each time the game saves.
   - `loaded: back to` when you load a save.
 
-Pressing **F11** adds a report: your train front to back and which vehicles carry passengers, the service's name as the game gives it, each passenger car and its count, the holding brake, the comfort so far, the game's time of day, each save file with what's kept beside it, what the objective box says and how big it is, and the game functions the mod uses with their parameters.
+Pressing **F11** adds a report: the class of the vehicle you drive and the component the train's list comes from, your train front to back and which vehicles carry passengers, the service's name as the game gives it, each passenger car and its count, the holding brake, the comfort so far, the game's time of day, each save file with what's kept beside it, what the objective box says and how big it is, and the game functions the mod uses with their parameters.
 
 **Nothing changes in the objective box:**
 - Look for `[Comfort] loaded` in the log. If it's missing, UE4SS didn't load the mod.
@@ -104,7 +104,7 @@ Pressing **F11** adds a report: your train front to back and which vehicles carr
 
 **No passenger numbers:**
 - Look for `passenger cars on your train`.
-- A line saying `only the vehicle you drive` means the game wouldn't list your train, and the reason follows. Only the vehicle you drive is counted then.
+- A line saying `the player's trains` or `only the vehicle you drive` means the game wouldn't list your train, and the reason follows. The mod then searches the world's passenger cars, which makes the game stutter once as you get aboard. With `the player's trains` the count is still your whole train; with `only the vehicle you drive` it's just that vehicle.
 - A line saying `can't count the passengers` means the count couldn't be read. Comfort is still judged then.
 
 **The line runs onto two lines:** the minimal HUD wraps its second line at about 40 characters. Turn off **ShowPassengers** or **ShowComfort**.
@@ -128,9 +128,12 @@ It was built from the game's own files: the objective box's layout and logic (it
 - The comfort was kept beside both the game's save and its checkpoint.
 - After starting the game again and loading the save, the comfort came back as it was: 4 rides done at comfort 100, and 99 with the firm braking in the ride going on.
 - The time of day came from the game's written-out clock (`GetLocalTimeOfDayAsString`). The `GetDateTime` way didn't work, and the log doesn't say why.
-- Not about saves: on the Class 375 the mod couldn't call `GetFormation` (UE4SS called it a `TrivialObject`). It fell back to searching the world's passenger cars, which took 32 ms once on boarding, and found the train's 4 cars.
+- Not about saves: on the Class 375 the mod couldn't call `GetFormation` (UE4SS called it a `TrivialObject`). It fell back to searching the world's passenger cars, which took 32 ms once on boarding, and found the train's 4 cars (131 aboard).
+- Why, from the game's reflection tables: `GetFormation` belongs to the `RailVehicleComponent`, not to the rail vehicle the mod was asking. Each rail vehicle has one, as `RailVehiclePhysicsComponent`. The same call would have failed on every train, the Class 150 too: the fix after the first drive hadn't been driven before. It was also asked for the wrong order. In the game's list of orders, 0 is from the vehicle asked to the back, and the whole train front to back is 2.
+- **Fixed since (not yet driven):** the mod asks the vehicle's `RailVehiclePhysicsComponent`, or the first `RailVehicleComponent` on it, for the whole train front to back. It writes how in the log line on getting aboard. The F11 report shows the class of the vehicle you drive and its component. The search is only used if neither works.
 
 **Still to see in the game:**
+- the train listed by the game on getting aboard (`GetFormation of its RailVehiclePhysicsComponent` in the log), with no search
 - the passenger count for the whole train, against the game's own
 - the service's name: whether the game gives it back as the mod expects
 - whether "·" and "²" look right, and the second line fits on one line

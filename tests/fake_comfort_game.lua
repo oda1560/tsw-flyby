@@ -38,6 +38,18 @@ end
 
 local function invalid() return { IsValid = function() return false end } end
 
+-- UE4SS gives a member a game object hasn't got as a TrivialObject, so calling one is an error as in the game
+-- ("attempt to call a TrivialObject value (method 'GetFormation')"). Its properties (vars) are each read a call.
+local TRIVIAL = setmetatable({}, { __name = "TrivialObject" })
+local function members_as_ue4ss(o)
+    return setmetatable(o, { __index = function(self, k)
+        local v = rawget(self, "vars")[k]
+        if v == nil then return TRIVIAL end
+        call("read " .. k)
+        return v
+    end })
+end
+
 -- An FText, FName: UE4SS gives these with ToString.
 local function text(s) return { s = s, ToString = function(self) return self.s end } end
 function FText(s) return text(s) end
@@ -106,30 +118,71 @@ local function tarray(list)
     end }
 end
 
+local LEVEL = "/Game/Routes/Route/Maps/Route.Route:PersistentLevel"
+
+-- The part of a rail vehicle that knows its train, as in the game (RailVehicleComponent): GetFormation(mode) lists
+-- the vehicles' actors by EActorConnectionIterationMode, 0 InitialToBack and 1 InitialToFront (from this one),
+-- 2 FrontToBack, 3 BackToFront.
+local function vehicle_component(rv)
+    local rvc = object("RailVehicleComponent", rv.path .. ".RailVehiclePhysicsComponent0",
+        { owner = rv, kinds = { RailVehicleComponent = true } })
+    rvc.GetOwner = function(self) return self.owner end
+    rvc.GetFormation = function(self, mode)
+        call("GetFormation")
+        if Sim.opts.no_formation then error("bad call") end
+        local list = rawget(self.owner, "consist")
+        local at = 1
+        for i, v in ipairs(list) do if v == self.owner then at = i end end
+        local from, to, step
+        if mode == 0 then from, to, step = at, #list, 1
+        elseif mode == 1 then from, to, step = at, 1, -1
+        elseif mode == 2 then from, to, step = 1, #list, 1
+        elseif mode == 3 then from, to, step = #list, 1, -1
+        else error("bad parameter") end
+        local out = {}
+        for i = from, to, step do out[#out + 1] = list[i] end
+        return tarray(out)
+    end
+    rvc.GetForwardsVelocity = function()
+        call("GetForwardsVelocity")
+        return Sim.v
+    end
+    return rvc
+end
+
+-- A rail vehicle's model actor (RVM_...): no GetFormation of its own, its RailVehicleComponent as the property
+-- RailVehiclePhysicsComponent. Sim.opts.vehicle_component "by class": only GetComponentByClass finds it; "none": it
+-- has none.
+local function vehicle(name, consist)
+    local how = Sim.opts.vehicle_component
+    local rv = members_as_ue4ss(object(name, LEVEL .. "." .. name .. "_1",
+        { consist = consist, kinds = { RailVehicle = true }, vars = {} }))
+    if how ~= "none" then
+        rv.rvc = vehicle_component(rv)
+        if how ~= "by class" then rv.vars.RailVehiclePhysicsComponent = rv.rvc end
+    end
+    rv.GetComponentByClass = function(self, cls)
+        call("GetComponentByClass")
+        local want = { PassengerCargoModelComponent = "cargo", RailVehicleComponent = "rvc" }
+        local c = want[cls.short] and rawget(self, want[cls.short])
+        return c or invalid()
+    end
+    rv.GetAttachParentActor = function() return invalid() end
+    table.insert(consist, rv)
+    return rv
+end
+
 -- The game's objects for a drive: the train, the player in it, the HUD.
 local function build(opts)
-    local level = "/Game/Routes/Route/Maps/Route.Route:PersistentLevel"
+    local level = LEVEL
     local train, ai_train = {}, {}
-    local function vehicle(name, consist)
-        local rv = object(name, level .. "." .. name .. "_1", { consist = consist, kinds = { RailVehicle = true } })
-        rv.GetFormation = function(self, mode)
-            call("GetFormation")
-            if opts.no_formation or mode ~= 0 then error("bad call") end
-            return tarray(self.consist)
-        end
-        rv.GetComponentByClass = function(self, cls)
-            call("GetComponentByClass")
-            if cls.short == "PassengerCargoModelComponent" and self.cargo then return self.cargo end
-            return invalid()
-        end
-        rv.GetAttachParentActor = function() return invalid() end
-        table.insert(consist, rv)
-        return rv
-    end
     drivable = vehicle("RVM_Class150_DMS", train)
     local cars = { drivable, vehicle("RVM_Class150_DMSL", train) }
     local loco = vehicle("RVM_Class66", train)
     local ai = vehicle("RVM_AI_Class323", ai_train)
+    if opts.drive_from_back then                 -- the one you drive at the back of the train's list
+        for i = 1, #train // 2 do train[i], train[#train + 1 - i] = train[#train + 1 - i], train[i] end
+    end
     Sim.train = train
     -- the train's own holding brake, a simulation node that a Class 350 has
     Sim.hold_node, Sim.hold_on = opts.hold and "DirectBrakeControlPowered" or nil, false
@@ -235,11 +288,21 @@ end
 -- from 0 at time of day `day`, the train standing. Sim.load_hud() then, as for the first.
 function Sim.new_world(day)
     for _, o in ipairs({ pc, pawn, view, Sim.widget, Sim.template }) do o.valid = false end
-    for _, v in ipairs(Sim.train) do v.valid = false end
+    for _, v in ipairs(Sim.train) do
+        v.valid = false
+        if rawget(v, "rvc") then v.rvc.valid = false end
+    end
     Sim.time, Sim.day0, Sim.v, Sim.acc, Sim.drive = 0.0, day, 0.0, 0.0, nil
     Sim.blueprint_loaded = false
     build(Sim.opts)
     for _, fn in ipairs(Sim.notify["/Script/Engine.PlayerController"] or {}) do fn(pc) end
+end
+
+-- Another vehicle coupled to the back of your train, with n passengers aboard.
+function Sim.couple(name, n)
+    local rv = vehicle(name, Sim.train)
+    table.insert(Sim.cargo, 1, cargo(rv, n))
+    return rv
 end
 
 -- The game showing an objective, as its HUD does: SetObjective, then ShowObjective (Name and Description written).
@@ -328,7 +391,8 @@ end
 function FindObjects() return {} end
 function StaticFindObject(path)
     local cls = path:match("^/Script/TS2Prototype%.([%w_]+)$")
-    if cls == "RailVehicleView" or cls == "RailVehicle" or cls == "PassengerCargoModelComponent" then
+    if cls == "RailVehicleView" or cls == "RailVehicle" or cls == "RailVehicleComponent"
+        or cls == "PassengerCargoModelComponent" then
         return object("Class", path, { short = cls })
     end
     if path == "/Script/TS2Prototype.Default__PhysicsFunctionLibrary" then return Sim.physics end
