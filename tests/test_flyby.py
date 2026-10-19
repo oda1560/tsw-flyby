@@ -689,6 +689,48 @@ class FlyBy(unittest.TestCase):
         self.assertIsNone(self.sim.camera())
         self.assertIn("6 away from your train", self.logs())
 
+    def let_go(self):
+        """The game letting go of every coach's seat groups, as it does with a car's seats when the car is far off: they
+        drop to the world's origin and stay there."""
+        for g in self.sim.groups.values():
+            if g.owner.address in self.coach_views():
+                g.loose = True
+
+    def test_seats_the_game_has_let_go_of_are_sat_in_on_their_car(self):
+        self.start(speed=30 * M, start=300 * M)                # as the Rotem cab car's were in the game
+        self.let_go()
+        self.sim.press("FOUR")
+        seat = self.sitting()
+        self.assertIsNotNone(seat)                              # at the seat on its car, not under the line
+        self.assertIn(self.sat_group().owner.address, self.coach_views())
+        before = self.sim.camera_place(self.sim.camera())[0].X
+        self.sim.run(5)
+        self.assertEqual(self.sitting(), seat)                  # and riding along
+        self.assertAlmostEqual(self.sim.camera_place(self.sim.camera())[0].X - before, 150 * M, delta=1 * M)
+        self.assertIn("4 passenger, 0 unmarked and 1 crew on your train, 4 let go of by the game", self.logs())
+        self.assertRegex(self.logs(), r"the game had let go of the group \(it's at (-600|300) 0 0\), so it goes by "
+                                      r"its place on the car, (-600|300) 0 0")
+        self.sim.press("F10")
+        self.assertIn("(let go of by the game): passenger", self.logs())
+        self.no_errors()
+
+    def test_seats_the_game_has_let_go_of_far_from_the_worlds_origin_are_still_found(self):
+        self.start(speed=20 * M, start=1500 * M)
+        self.let_go()
+        self.sim.press("FOUR")
+        self.assertIsNotNone(self.sitting())
+        self.assertIn("16 passenger seats on your train", self.logs())
+
+    def test_the_game_letting_go_of_your_seat_while_you_sit_there(self):
+        self.start(speed=30 * M, start=300 * M)
+        self.sim.press("FOUR")
+        seat = self.sitting()
+        self.sat_group().loose = True
+        self.sim.run(5)
+        self.assertEqual(self.sitting(), seat)
+        self.assertTrue(self.on_camera())
+        self.no_errors()
+
     def test_report_lists_the_seats(self):
         self.start(speed=20 * M)
         self.sim.press("F10")
@@ -702,7 +744,7 @@ class FlyBy(unittest.TestCase):
         self.sim.press("FOUR")
         self.sim.press("F10")
         self.assertIn("camera in a seat", self.logs())
-        self.assertIn("attached to the seat", self.logs())
+        self.assertIn("attached to its vehicle", self.logs())
         self.no_errors()
 
     # ---- the passenger's head
@@ -923,6 +965,8 @@ class FlyBy(unittest.TestCase):
         close(rd(fm.combine(r(0, 0, 0), b)), rd(b))
         p = v(3, -7, 11)
         close(vd(fm.turn(fm.combine(a, b), p)), vd(fm.turn(a, fm.turn(b, p))))
+        close(rd(fm.uncombine(a, fm.combine(a, b))), rd(b))                    # and back
+        close(rd(fm.uncombine(r(0, 90, 0), r(0, 180, 0))), (0, 90, 0))
 
     def test_report_runs_on_and_off(self):
         self.start(speed=20 * M)

@@ -102,6 +102,18 @@ local function actor_methods(o)
     o.GetVelocity = function(self) return self.vel or vec(0, 0, 0) end
     o.GetAttachParentActor = function(self) return self.parent or invalid() end
     o.GetClass = function(self) return Sim.fake_class(self.name .. "_C") end
+    -- its root component, which its seat groups and the seat view's camera attach to
+    o.K2_GetRootComponent = function(self)
+        if not self.root then
+            self.root = object("SceneComponent " .. self.name .. ".DefaultSceneRoot", { owner = self, is_root = true })
+            self.root.K2_GetComponentLocation = function(r) return to_world((Sim.component_place(r))) end
+            self.root.K2_GetComponentRotation = function(r)
+                local _, y = Sim.component_place(r)
+                return { Pitch = 0, Yaw = y, Roll = 0 }
+            end
+        end
+        return self.root
+    end
     -- the seat groups on it (opts.search_only: the game won't say, they can only be searched for)
     o.K2_GetComponentsByClass = function(self, class)
         if Sim.opts.search_only then error("no K2_GetComponentsByClass") end
@@ -141,17 +153,24 @@ local function tarray(list)
 end
 Sim.tarray = tarray
 
--- Where a seat group is, in line coordinates, and its yaw.
+-- Where a seat group belongs on its vehicle, in line coordinates, and its yaw.
 function Sim.group_place(g)
     local view = g.owner
     local vyaw = yaw_of(view.fwd or vec(1, 0, 0))
     return add(view.loc, turn_yaw(vyaw, g.rel)), vyaw + g.yaw
 end
 
+-- Where a component the camera can attach to is, in line coordinates, and its yaw: a seat group, or a vehicle's root.
+function Sim.component_place(c)
+    if c.is_root then return c.owner.loc, yaw_of(c.owner.fwd or vec(1, 0, 0)) end
+    return Sim.group_place(c)
+end
+
 Sim.groups = {}
 -- seats: { { pos = vec, face = yaw it faces, offset = vec or nil, taken = bool } }. Each seat's LocalRotation is the
 -- way it faces, or (opts.socket_rotation) a quarter turn less, as Unreal's characters face their Y axis and the
--- Class 331's seats turned out to.
+-- Class 331's seats turned out to. A group the game has let go of (g.loose), as it does with a car's seats when the
+-- car is far off, is attached to nothing and keeps its place relative to the root: it's at that place in the world.
 local function seat_group(view, name, role, rel, yaw, seats, multi)
     for _, s in ipairs(seats) do s.yaw = s.face - (Sim.opts.socket_rotation and 90 or 0) end
     local g = object((multi and "MultiSeatComponent " or "SeatComponent ") .. view.name .. ".Seats" .. (#Sim.groups + 1), {
@@ -166,10 +185,15 @@ local function seat_group(view, name, role, rel, yaw, seats, multi)
     end
     g.SeatRegions = tarray(regions)
     g.GetOwner = function(self) return self.owner end
-    g.K2_GetComponentLocation = function(self) return to_world((Sim.group_place(self))) end
+    g.GetAttachParent = function(self) return self.loose and invalid() or self.owner:K2_GetRootComponent() end
+    g.RelativeLocation, g.RelativeRotation = rel, { Pitch = 0, Yaw = yaw, Roll = 0 }
+    g.K2_GetComponentLocation = function(self)
+        if self.loose then return vec(self.rel.X, self.rel.Y, self.rel.Z) end
+        return to_world((Sim.group_place(self)))
+    end
     g.K2_GetComponentRotation = function(self)
         local _, y = Sim.group_place(self)
-        return { Pitch = 0, Yaw = y, Roll = 0 }
+        return { Pitch = 0, Yaw = self.loose and self.yaw or y, Roll = 0 }
     end
     g.GetSeatRegionCount = function(self) return #self.seats end
     if not Sim.opts.no_region_functions then
@@ -225,10 +249,10 @@ function Sim.seat_eyes(g, eye_height)
     return out
 end
 
--- Where the camera is, in line coordinates, and its yaw: attached to a seat group, from the group.
+-- Where the camera is, in line coordinates, and its yaw: attached to something, from that.
 local function camera_place(cam)
     if cam.attach then
-        local at, yaw = Sim.group_place(cam.attach)
+        local at, yaw = Sim.component_place(cam.attach)
         return add(at, turn_yaw(yaw, cam.rel_loc)), yaw + cam.rel_rot.Yaw
     end
     return cam.loc, cam.rot and cam.rot.Yaw or 0
@@ -254,8 +278,8 @@ local function new_camera(loc, rot)
     cam.K2_TeleportTo = function(self, l, r) self.loc = to_line(l); self.rot = r; return true end
     cam.K2_SetActorLocation = function(self, l) self.loc = to_line(l); return true end
     cam.K2_SetActorRotation = function(self, r)
-        if self.attach then -- the world rotation asked for, kept relative to the seat group it's attached to
-            local _, gyaw = Sim.group_place(self.attach)
+        if self.attach then -- the world rotation asked for, kept relative to what it's attached to
+            local _, gyaw = Sim.component_place(self.attach)
             self.rel_rot = { Pitch = r.Pitch, Yaw = r.Yaw - gyaw, Roll = r.Roll }
         else
             self.rot = r
@@ -270,7 +294,7 @@ local function new_camera(loc, rot)
     end
     cam.K2_AttachToComponent = function(self, comp, socket, loc_rule, rot_rule, scale_rule)
         if Sim.opts.no_attach then error("attaching not allowed") end
-        assert(socket ~= nil and loc_rule == 2 and rot_rule == 2, "attach: snap to the seat")
+        assert(socket ~= nil and loc_rule == 2 and rot_rule == 2, "attach: snap to it")
         self.attach, self.rel_loc, self.rel_rot = comp, vec(0, 0, 0), { Pitch = 0, Yaw = 0, Roll = 0 }
         return true
     end

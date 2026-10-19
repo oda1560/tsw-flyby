@@ -268,7 +268,7 @@ function M.needs_new_spot(cam, train, tr, placed_dir, s)
 end
 
 ----------------------------------------------------------------------------------------------------
--- The seat view: a seat sits turned in its seat component, which sits turned in its vehicle.
+-- The seat view: a seat sits turned in its seat component, which sits turned on its vehicle.
 
 -- The forward, right and up axes of an Unreal rotator (as FRotationMatrix has them).
 function M.axes(r)
@@ -294,14 +294,24 @@ function M.unturn(r, v)
     return vec(dot(v, x), dot(v, y), dot(v, z))
 end
 
--- The rotation of something turned by `inner` in a frame turned by `outer` (back to a rotator as FMatrix does).
-function M.combine(outer, inner)
-    local x, y, z = M.axes(inner)
-    x, y, z = M.turn(outer, x), M.turn(outer, y), M.turn(outer, z)
+-- The rotator with these forward, right and up axes (as FMatrix does it).
+local function rotator(x, y, z)
     local pitch = math.deg(math.atan(x.Z, math.sqrt(x.X * x.X + x.Y * x.Y)))
     local yaw = math.deg(math.atan(x.Y, x.X))
     local _, flat_right = M.axes({ Pitch = pitch, Yaw = yaw, Roll = 0 })
     return { Pitch = pitch, Yaw = yaw, Roll = math.deg(math.atan(dot(z, flat_right), dot(y, flat_right))) }
+end
+
+-- The rotation of something turned by `inner` in a frame turned by `outer`.
+function M.combine(outer, inner)
+    local x, y, z = M.axes(inner)
+    return rotator(M.turn(outer, x), M.turn(outer, y), M.turn(outer, z))
+end
+
+-- The rotation, in a frame turned by `outer`, of something turned by `r` outside it: M.combine backwards.
+function M.uncombine(outer, r)
+    local x, y, z = M.axes(r)
+    return rotator(M.unturn(outer, x), M.unturn(outer, y), M.unturn(outer, z))
 end
 
 -- Where a seat's camera goes, in its seat component's frame: the seat's own camera offset, turned with the seat, or

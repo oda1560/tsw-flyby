@@ -101,7 +101,7 @@ The seats are the game's own: the ones you can sit in when walking through a tra
 1. It asks the game for the vehicles of your train, and finds the seat groups on them.
 2. It goes by each group's role first (passenger, driver or guard), then its name (first class, standard class, driver's seat, steps and so on). Some trains (the Class 331 for one) leave the name at the game's default, which reads as "Engineer", so that name alone doesn't count. A multi-seat counts as passenger seating unless its role says otherwise. It leaves out cab seats, guard's seats, steps and ladders. If no seat on the train says what it is, any of them will do.
 3. It picks a random seat, preferring one with no passenger of the game's sitting in it, and never the one you're already in.
-4. It attaches the camera to the seat, so it rides with the train exactly. If the game won't attach it, the camera is moved to the seat every frame instead.
+4. It attaches the camera to the seat's vehicle, at the seat, so it rides with the train exactly. If the game won't attach it, the camera is moved to the seat every frame instead. The game lets go of a car's seats when the car is far off (the Rotem cars' beyond 80 m), and they drop to the world's origin and stay there; the mod places those where they belong on their car.
 5. It works out which way the seat faces by finding its back: a short line traced forward and back from the passenger's eyes hits the headrest on one side. If neither side hits anything, it goes by the seat's own rotation. Unreal's characters face their Y axis, and the Class 331's seats are turned that way.
 6. Each frame, the passenger's head (`seat_head.lua`) decides where they look and how far it has moved. Where they look follows their seat and their window, whichever way the train goes. How their head leans and shakes follows the train: its speed and way of travel come from the vehicle's own velocity.
 
@@ -115,7 +115,7 @@ Everything the mod does is written to `ue4ss\UE4SS.log` in the game's Win64 fold
 - **Each spot:** how far ahead, which side, the ground height, and whether the line and the train are in view.
 - **Every 2 seconds while on:** where the train is and how far it moved. Turn these off with `DebugLog = false`.
 - **The game taking the view:** each time, and what it switched to.
-- **Each seat:** which seat and vehicle, where the eyes went, which way it faces, and whether the camera is attached. Before that, how many seats it found on your train, on other trains and away from the train.
+- **Each seat:** which seat and vehicle, where the eyes went, which way it faces, whether the game had let go of its group, and whether the camera is attached. Before that, how many seats it found on your train, on other trains and away from the train.
 - **Every 2 seconds in a seat:** where the camera is and how far from the middle of its vehicle (it stays the same if the camera rides along properly), the speed, and how far round from the way of travel the passenger is looking.
 - **The mouse:** the first time it turns the seat view, or that it can't be read.
 
@@ -160,14 +160,19 @@ Pressing **F10** in a drive adds a report: which vehicle it would follow, everyt
 **Seat view, third try, same day and train:**
 - Nearly right. Passengers in backward-facing seats looked round towards the front, which looked like their heads were turned too far. Since fixed: everyone looks the way their seat faces, towards their own window.
 
+**Seat view, same day (BL36PH with three Rotem cars, `MPB_TR`):**
+- 4 found 362 seats in 3 multi-seats, one per car. In the coaches the camera rode along at the seats' eyes, and the mouse turned the view.
+- Now and then the camera sat still under the track. Every time, the seat was in the cab car at the back. The Rotem cars' blueprints have the game unregister and detach their seats once the car is more than 80 m off, so the cab car's seat group had dropped to the world's origin and stayed there, and the camera with it. Since fixed: the camera rides on the car itself, and a seat group the game has let go of is placed where it belongs on its car (`let go of by the game` in the log).
+- The line traces found no seat backs on these cars: every seat's facing was guessed from its rotation.
+
 **Still to see in the game:**
 - the first spot on curves since that fix
 - the camera moving itself on once the train is past (every test so far was switched off first)
 - 7 moving to a new spot while on
+- a seat in a car the game had let go of: whether the car's seats and passengers are drawn once you sit there (the Rotem cars' seat models are let go of beyond 80 m too)
 - the passenger's head in the game. The seat classes and their fields were read from `TrainSimWorld.exe` and the 331's own blueprints, and the key bindings from the game's `DefaultInput.ini`. Still to see:
-  - whether the line traces find the seats' backs (`its back ... behind` in the log) or it has to guess
+  - whether the line traces find the seats' backs (`its back ... behind` in the log) on any train, or it always has to guess
   - whether the gaze, shake and glances feel right
-  - whether the mouse turns it (`the mouse turns the seat view` in the log)
   - whether the game hides the passenger in that seat
 
 ## For working on it
