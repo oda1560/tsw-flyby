@@ -89,6 +89,7 @@ class FlyBy(unittest.TestCase):
         self.assertAlmostEqual(x - self.train()[0], 8 * 40 * M, delta=10 * M)  # 8 seconds ahead at 40 m/s
         self.assertAlmostEqual(abs(y), 12 * M, delta=1 * M)     # 12 m to the side
         self.assertAlmostEqual(z, 1.7 * M, delta=1)             # standing on the ground
+        self.assertIn("line in view, train in view (1 of 12 spots tried, 15 traces", self.logs())
         self.assertFalse(self.sim.camera().CameraComponent.bConstrainAspectRatio)
         self.assertIn("timed the train at 40.0 m/s", self.logs())
         self.no_errors()
@@ -139,7 +140,7 @@ class FlyBy(unittest.TestCase):
         self.sim.run(0.1)
         after = self.camera()
         self.assertTrue(self.on_camera())
-        self.assertIn("new spot 160 m ahead on the left (you asked for a new spot)", self.logs())
+        self.assertIn("new spot 160 m ahead, 12 m to the left (you asked for a new spot)", self.logs())
         self.assertGreater(after[0], before[0])                 # further on
         self.assertLess(after[1] * before[1], 0)                # and across the line
 
@@ -360,7 +361,44 @@ class FlyBy(unittest.TestCase):
         self.lua.execute("Sim.walls = { { min = { X = 0, Y = 300, Z = -1000 }, max = { X = 200000, Y = 500, Z = 1000 } } }")
         self.switch_on()
         self.assertLess(self.camera()[1], 0)                    # left, away from the wall on the right
-        self.assertIn("line in view, train in view (spot 2 tried)", self.logs())
+        self.assertIn("line in view, train in view (2 of 12 spots tried", self.logs())
+
+    def test_a_view_low_over_a_bank_is_in_the_grass(self):
+        # A bank 1.2 m high, 7 to 10 m out on the right. From 12 m out the view across to the line clears it by
+        # 0.8 m: line traces go through the grass on it, but you wouldn't see much of the train.
+        self.start(speed=40 * M)
+        self.lua.execute("Sim.ground = function(x, y) return (y >= 700 and y <= 1000) and 120 or 0 end")
+        self.switch_on()
+        self.assertLess(self.camera()[1], 0)                    # left, away from the bank
+        self.assertIn("tried a spot 320 m ahead, 12 m to the right: ground -0.5 m from the train, "
+                      "line in the grass (0.8 m over the ground 4 m out), train in view", self.logs())
+        self.assertIn("line in view, train in view (2 of 12 spots tried", self.logs())
+
+    def test_in_a_narrow_place_it_stands_closer_in(self):
+        # Banks on both sides, 8 to 10 m out: from 12 m out the view crosses them in the grass. By the track it's clear.
+        self.start(speed=40 * M)
+        self.lua.execute("Sim.ground = function(x, y) return (math.abs(y) >= 800 and math.abs(y) <= 1000) "
+                         "and 120 or 0 end")
+        self.switch_on()
+        x, y, z = self.camera()
+        self.assertAlmostEqual(abs(y), 6 * M, delta=1)          # 6 m to the side
+        self.assertAlmostEqual(x - self.train()[0], 8 * 40 * M, delta=10 * M)  # still 8 seconds ahead
+        self.assertAlmostEqual(z, 1.7 * M, delta=1)
+        self.assertIn("new spot 320 m ahead, 6 m to the right", self.logs())
+        self.assertIn("line in view, train in view (5 of 12 spots tried", self.logs())
+        self.no_errors()
+
+    def test_where_no_view_is_clear_it_takes_the_best_after_trying_every_spot(self):
+        # GrassHeight above EyeHeight puts nearly every view in the grass, and a wall hides the right. Closer in on the
+        # left, the view across to the line rises clear of it: the best there is.
+        self.start(settings={"GrassHeight": 1.9}, speed=40 * M)
+        self.lua.execute("Sim.walls = { { min = { X = 0, Y = 300, Z = -1000 }, max = { X = 200000, Y = 500, Z = 1000 } } }")
+        self.switch_on()
+        self.assertIn("tried a spot 320 m ahead, 12 m to the left: ground -0.5 m from the train, line in the grass "
+                      "(1.8 m over the ground 2 m out), train in the grass (1.7 m over the ground 2 m out)", self.logs())
+        self.assertIn("new spot 320 m ahead, 6 m to the left (switched on)", self.logs())
+        self.assertIn("line in view, train in the grass (1.7 m over the ground 2 m out) (12 of 12 spots tried",
+                      self.logs())
 
     def test_with_view_checks_off_it_does_no_traces(self):
         self.start(settings={"CheckView": False}, speed=40 * M)

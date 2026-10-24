@@ -176,8 +176,11 @@ end
 ----------------------------------------------------------------------------------------------------
 -- Picking a spot
 
+local traces = 0 -- line traces done, for the log
+
 -- Where a line from `from` to `to` first hits something, or nil when it's clear.
 local function trace(pc, from, to)
+    traces = traces + 1
     local hit = {}
     local none = { R = 0, G = 0, B = 0, A = 0 }
     local blocked = UEHelpers.GetKismetSystemLibrary():LineTraceSingle(
@@ -187,8 +190,29 @@ local function trace(pc, from, to)
     return FM.vec(p.X, p.Y, p.Z)
 end
 
--- Stands the spot on the ground, then scores it: 2 for a clear view across to the line, 1 for seeing the train
--- coming. Notes what it found in spot.notes.
+-- How the view from `eye` to `target` is: "in view"; "in the grass" when the ground comes within GrassHeight under it
+-- on the way, up to `short` centimetres from the target (grass and bushes don't stop a line trace, so the ground
+-- just under the view is taken as grass in it); or "hidden" when something's in the way. In the grass, also how
+-- far over the ground the view went and where.
+local function view_to(pc, eye, target, short)
+    if trace(pc, eye, target) then return "hidden" end
+    local down = FM.vec(0, 0, S.GrassHeight * CM)
+    for _, p in ipairs(FM.view_points(eye, target, short)) do
+        local ground = trace(pc, p.pos, FM.sub(p.pos, down))
+        if ground then
+            return "in the grass", string.format("%.1f m over the ground %.0f m out", (p.pos.Z - ground.Z) / CM,
+                p.at / CM)
+        end
+    end
+    return "in view"
+end
+
+local VIEW_SCORE = { ["in view"] = 2, ["in the grass"] = 1, hidden = 0 }
+local BEST_SCORE = 6    -- the line and the train both in view
+local TRACKBED = 3 * CM -- grass isn't looked for under the view across to the line this close to the line
+
+-- Stands the spot on the ground, then scores it on the view across to the line and the view of the train coming,
+-- the line counting twice: each 2 in view, 1 in the grass, 0 hidden. Notes what it found in spot.notes.
 local function rate_spot(pc, spot, train_pos)
     local up = FM.vec(0, 0, 30 * CM)
     local line_z = spot.pos.Z - S.HeightAboveTrain * CM
@@ -199,36 +223,34 @@ local function rate_spot(pc, spot, train_pos)
     else
         spot.notes = "no ground found"
     end
-
-    local score = 0
-    local across = FM.add(spot.track, FM.vec(0, 0, S.AimHeight * CM))
-    if not trace(pc, spot.pos, across) then
-        score = score + 2
-        spot.notes = spot.notes .. ", line in view"
-    else
-        spot.notes = spot.notes .. ", line hidden"
+    local function note(what, how, where)
+        spot.notes = string.format("%s, %s %s%s", spot.notes, what, how, where and " (" .. where .. ")" or "")
     end
+
+    local across = FM.add(spot.track, FM.vec(0, 0, S.AimHeight * CM))
+    local how, where = view_to(pc, spot.pos, across, TRACKBED)
+    note("line", how, where)
+    local score = 2 * VIEW_SCORE[how]
 
     local coming = FM.add(train_pos, FM.vec(0, 0, S.AimHeight * CM))
     local toward = FM.sub(coming, spot.pos)
     local d = FM.len(toward)
     if d > 20 * CM then
         local short_of_train = FM.add(spot.pos, FM.scale(toward, (d - 15 * CM) / d)) -- don't count the train itself
-        if not trace(pc, spot.pos, short_of_train) then
-            score = score + 1
-            spot.notes = spot.notes .. ", train in view"
-        else
-            spot.notes = spot.notes .. ", train hidden"
-        end
+        how, where = view_to(pc, spot.pos, short_of_train, 0)
+        note("train", how, where)
+        score = score + VIEW_SCORE[how]
     end
     return score
 end
+
+local function side_name(side) return side > 0 and "right" or "left" end
 
 local function choose_spot(pc, train_pos, dir)
     local spots = FM.candidates(train_pos, dir, state.tracker, S, state.next_side)
     if not S.CheckView or state.traces_broken then
         spots[1].notes = "not checked"
-        return spots[1], 0
+        return spots[1], 0, #spots
     end
     local best, best_score, tried = spots[1], -1, 0
     for _, spot in ipairs(spots) do
@@ -238,12 +260,16 @@ local function choose_spot(pc, train_pos, dir)
             log("can't check the view (%s), placing without checks from now on", tostring(score))
             state.traces_broken = true
             spots[1].notes = "not checked"
-            return spots[1], tried
+            return spots[1], tried, #spots
         end
         if score > best_score then best, best_score = spot, score end
-        if score >= 3 then break end
+        if score >= BEST_SCORE then break end
+        if S.DebugLog then
+            log("tried a spot %.0f m ahead, %.0f m to the %s: %s", spot.ahead / CM, spot.out / CM,
+                side_name(spot.side), spot.notes)
+        end
     end
-    return best, tried
+    return best, tried, #spots
 end
 
 local function place(pc, why)
@@ -254,19 +280,20 @@ local function place(pc, why)
         local fwd = forward_of(train)
         dir = fwd and FM.flat_dir(fwd) or FM.vec(1, 0, 0)
     end
-    local spot, tried = choose_spot(pc, train_pos, dir)
+    local started, traces_before = os.clock(), traces
+    local spot, tried, of = choose_spot(pc, train_pos, dir)
     local facing = FM.look_at(spot.pos, train_pos)
     if not cam:K2_TeleportTo(spot.pos, facing) then
         cam:K2_SetActorLocation(spot.pos, false, {}, true)
         cam:K2_SetActorRotation(facing, false)
     end
-    local side = spot.side > 0 and 1 or -1
-    if S.Side == "alternate" then state.next_side = -side end
+    if S.Side == "alternate" then state.next_side = -spot.side end
     state.placed_dir = dir
     state.placed_at = game_time(pc)
-    log("new spot %.0f m ahead on the %s (%s): train %.1f m/s, line %s, %s (spot %d tried)",
-        FM.len2(FM.sub(spot.track, train_pos)) / CM, side > 0 and "right" or "left", why,
-        state.tracker.speed / CM, FM.describe_curve(state.tracker.curvature), spot.notes or "", tried)
+    log("new spot %.0f m ahead, %.0f m to the %s (%s): train %.1f m/s, line %s, %s (%d of %d spots tried, %d "
+        .. "traces in %.0f ms)", FM.len2(FM.sub(spot.track, train_pos)) / CM, spot.out / CM, side_name(spot.side),
+        why, state.tracker.speed / CM, FM.describe_curve(state.tracker.curvature), spot.notes or "", tried, of,
+        traces - traces_before, (os.clock() - started) * 1000)
 end
 
 ----------------------------------------------------------------------------------------------------

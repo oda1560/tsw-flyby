@@ -221,11 +221,15 @@ function M.predict(origin, dir, curvature, grade, s)
     return p, out_dir
 end
 
--- Spots to try for the camera, best first. Each has `pos` (camera, before finding the ground)
--- and `track` (the point on the line it looks across to). `side` is +1 for right, -1 for left.
+-- Spots to try for the camera, best first: how much of the lead distance ahead, and how far to the side in
+-- SideOffsets, or in CloseOffsets when the third is true. Further out (1.8) sees over a fence or a wall by the line;
+-- closer in is for narrow places, where further out is up a bank, or looks across one, in the grass.
+-- Each has `pos` (camera, before finding the ground) and `track` (the point on the line it looks across to).
+-- `side` is +1 for right, -1 for left; `out` is how far from the line and `ahead` how far ahead.
 local TRIES = {
     { 1.0, 1.0 }, { 1.0, -1.0 }, { 0.7, 1.0 }, { 0.7, -1.0 },
-    { 1.0, 1.8 }, { 1.0, -1.8 }, { 0.45, 1.0 }, { 0.45, -1.0 },
+    { 1.0, 1, true }, { 1.0, -1, true }, { 1.0, 1.8 }, { 1.0, -1.8 },
+    { 0.7, 1, true }, { 0.7, -1, true }, { 0.45, 1.0 }, { 0.45, -1.0 },
 }
 
 function M.lead_distance(speed, s)
@@ -241,10 +245,29 @@ function M.candidates(origin, dir, tr, s, side)
     local list = {}
     for _, try in ipairs(TRIES) do
         local track, line_dir = M.predict(origin, dir, tr.curvature, tr.grade, lead * try[1])
-        local offset = M.scale(M.right_of(line_dir), s.SideOffset * CM * try[2] * side)
-        local pos = M.add(track, offset)
+        local sign = (try[2] > 0 and 1 or -1) * side
+        local out = (try[3] and s.CloseOffset or s.SideOffset) * CM * math.abs(try[2])
+        local pos = M.add(track, M.scale(M.right_of(line_dir), out * sign))
         pos.Z = track.Z + s.HeightAboveTrain * CM
-        list[#list + 1] = { pos = pos, track = track, side = try[2] * side }
+        list[#list + 1] = { pos = pos, track = track, side = sign, out = out, ahead = lead * try[1] }
+    end
+    return list
+end
+
+-- How far out from the camera a view is looked along for the ground coming close under it (metres): closest
+-- together near the camera, where grass fills more of the picture.
+local LOW_VIEW_AT = { 2, 4, 7, 10, 15, 20, 30, 40, 50 }
+
+-- Points along the view from `eye` to `target` at which to look for the ground just under it, stopping `short`
+-- centimetres from the target. Each has `pos` and `at`, how far out from the camera it is.
+function M.view_points(eye, target, short)
+    local to = M.sub(target, eye)
+    local d = M.len(to)
+    local list = {}
+    for _, m in ipairs(LOW_VIEW_AT) do
+        local at = m * CM
+        if at > d - short then break end
+        list[#list + 1] = { pos = M.add(eye, M.scale(to, at / d)), at = at }
     end
     return list
 end

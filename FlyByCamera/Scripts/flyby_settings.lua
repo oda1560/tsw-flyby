@@ -18,10 +18,13 @@ return {
     MinLead = 60,             -- ...but at least this far ahead
     MaxLead = 350,            -- ...and at most this far
     SideOffset = 12,          -- this far to the side of the line
+    CloseOffset = 6,          -- or this close, in narrow places where further out the view is hidden or in the grass
     Side = "alternate",       -- "left", "right" or "alternate" from one spot to the next
     EyeHeight = 1.7,          -- this high above the ground, when the ground can be found
     HeightAboveTrain = 2.5,   -- otherwise this high above the train's own position
     CheckView = true,         -- look for hills, cuttings and buildings in the way before picking a spot
+    GrassHeight = 1.0,        -- and count the view as in the grass where it passes closer than this over the ground
+                              -- (grass doesn't stop the checks); keep it below EyeHeight
 
     -- When it moves on
     PassDistance = 200,       -- once the train is this far past the camera

@@ -1,6 +1,6 @@
 # TSW Fly-by Camera User Guide
 
-Last updated 2026-10-18
+Last updated 2026-10-24
 
 ## What it does
 
@@ -68,10 +68,12 @@ A few you may want:
 
 - **LeadSeconds, MinLead, MaxLead:** how far ahead it waits. 8 seconds of travel, between 60 and 350 m.
 - **SideOffset:** 12 m from the line.
+- **CloseOffset:** 6 m from the line, for narrow places where every spot 12 m out has its view hidden or in the grass. On double track that can be just beyond the other track.
 - **Side:** `"alternate"`, `"left"` or `"right"`.
 - **PassDistance:** how far past the train goes before the camera moves on, 200 m. Raise it for long trains.
 - **Zoom:** zooms in while the train is far away. Set to `false` for a fixed `Fov`.
-- **CheckView:** before picking a spot, looks for hills, cuttings, walls and buildings in the way, and stands the camera on the ground.
+- **CheckView:** before picking a spot, looks for hills, cuttings, walls and buildings in the way, and for the grass, and stands the camera on the ground.
+- **GrassHeight:** a view that passes closer than this over the ground counts as in the grass, 1 m. Raise it if the camera still ends up in the grass, but keep it below `EyeHeight` (1.7 m), or every view on flat ground counts as in the grass.
 - **SeatFov:** the field of view from a seat, 70 degrees.
 - **SeatEyeHeight:** for seats that don't say where a seated passenger's eyes are, the camera goes 1.15 m above the seat.
 - **SeatKey:** `"FOUR"`. Any key name from UE4SS's Key table works.
@@ -94,6 +96,17 @@ It times your train for its speed, and reads the vehicle's heading for the direc
 
 It carries that curve on ahead to guess where the line goes, then tries spots beside that point. It traces a line from each spot across to the track and towards the train, and takes the first spot with a clear view of both. It doesn't read the game's track data (yet), so a spot can be off just after a change of curve, a junction or a tunnel mouth. Press 7 for another.
 
+Grass and bushes don't stop a line trace, so a view through them looks clear. To catch that, the mod also looks for the ground under each view, at points from 2 m to 50 m out from the camera. Where the ground comes within `GrassHeight` (1 m) of the view, the view counts as in the grass. That happens on a bank, a hump or a hillside that the view runs low over.
+
+The spots it tries, best first:
+
+1. 12 m out on the side it's due, then on the other side, at the full distance ahead, then at 70% of it.
+2. 6 m out (`CloseOffset`), for narrow places. In a cutting or on a shelf, 12 m out is up the bank, but by the track the ground is level and the view clear.
+3. 22 m out, to see over a fence or a wall by the line.
+4. 6 m out at 70% of the distance, then 12 m out at 45% of it.
+
+The view across to the line counts twice as much as the view of the train coming. A view in the grass counts half as much as one in view. If no spot has both views clear, the mod tries all twelve and takes the best.
+
 ## How it picks a seat
 
 The seats are the game's own: the ones you can sit in when walking through a train. Each vehicle has groups of them, with each seat's position, the way it faces and where a seated passenger's eyes go. A cab seat or two is a `SeatComponent`; a car's passenger seating is usually one `MultiSeatComponent`.
@@ -112,7 +125,7 @@ If your vehicles won't list their seats, it searches every seat in the world and
 Everything the mod does is written to `ue4ss\UE4SS.log` in the game's Win64 folder, on lines starting `[FlyBy]`:
 
 - **Switching on:** which vehicle it follows and where it is, and the train's speed as timed and as the game reports it.
-- **Each spot:** how far ahead, which side, the ground height, and whether the line and the train are in view.
+- **Each spot:** how far ahead, how far to which side, the ground height, and whether the line and the train are in view, in the grass (how far over the ground the view went, and where) or hidden. Then how many spots it tried, the line traces that took, and how long. Before that, with `DebugLog` on, a `tried a spot` line for each spot it passed over.
 - **Every 2 seconds while on:** where the train is and how far it moved. Turn these off with `DebugLog = false`.
 - **The game taking the view:** each time, and what it switched to.
 - **Each seat:** which seat and vehicle, where the eyes went, which way it faces, whether the game had let go of its group, and whether the camera is attached. Before that, how many seats it found on your train, on other trains and away from the train.
@@ -165,10 +178,14 @@ Pressing **F10** in a drive adds a report: which vehicle it would follow, everyt
 - Now and then the camera sat still under the track. Every time, the seat was in the cab car at the back. The Rotem cars' blueprints have the game unregister and detach their seats once the car is more than 80 m off, so the cab car's seat group had dropped to the world's origin and stayed there, and the camera with it. Since fixed: the camera rides on the car itself, and a seat group the game has let go of is placed where it belongs on its car (`let go of by the game` in the log).
 - The line traces found no seat backs on these cars: every seat's facing was guessed from its rotation.
 
+**Drive, 2026-10-23 (Class 70 with JNA wagons):**
+- 7 moved the camera to a new spot while on.
+- You said the camera sometimes ends up in the grass in narrow places. The log shows 7 pressed eight times in a row: each time the left was hidden and the spot on the right was 1 to 2 m up a bank. Grass doesn't stop a line trace, so the mod counted those views as clear. Since changed: a view running low over the ground counts as in the grass, and in narrow places the camera can stand 6 m from the line.
+
 **Still to see in the game:**
+- whether the camera keeps out of the grass now, and how long the spot checks take (`traces in ... ms` in the log)
 - the first spot on curves since that fix
 - the camera moving itself on once the train is past (every test so far was switched off first)
-- 7 moving to a new spot while on
 - a seat in a car the game had let go of: whether the car's seats and passengers are drawn once you sit there (the Rotem cars' seat models are let go of beyond 80 m too)
 - the passenger's head in the game. The seat classes and their fields were read from `TrainSimWorld.exe` and the 331's own blueprints, and the key bindings from the game's `DefaultInput.ini`. Still to see:
   - whether the line traces find the seats' backs (`its back ... behind` in the log) on any train, or it always has to guess
