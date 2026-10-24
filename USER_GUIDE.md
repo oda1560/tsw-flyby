@@ -8,7 +8,7 @@ Press **7** while driving in Train Sim World 7. After a moment spent timing your
 
 Press **4** for the view from a random passenger seat on your train. The camera sits at a passenger's eye height and rides along with the train. Press **4** again to move to another random seat. From the seat view, **7** goes to the fly-by camera, and from the fly-by, **4** goes to a seat.
 
-The passenger looks the way their seat faces, turned towards the window nearest them: ahead in a forward-facing seat, back along the train in a backward-facing one. Their gaze wanders a little, and now and then they glance elsewhere for a few seconds: straight out of the window, back along the train, across the car, or down. Their head shakes with the track, more the faster the train goes. It leans back as the train speeds up, forward as it brakes and out on curves. Move the mouse to look around yourself; a few seconds after you leave it, the passenger goes back to looking out of the window.
+The passenger looks the way their seat faces, turned towards the window nearest them: ahead in a forward-facing seat, back along the train in a backward-facing one. On seats along the side of the car facing inward, as on many metro and commuter trains, they look straight across the car. Their gaze wanders a little, and now and then they glance elsewhere for a few seconds: straight out of the window, back along the train, across the car, or down. Their head shakes with the track, more the faster the train goes. It leans back as the train speeds up, forward as it brakes and out on curves. Move the mouse to look around yourself; a few seconds after you leave it, the passenger goes back to looking out of the window.
 
 You can keep driving while either view is on: the game's controls, HUD and keys all still work.
 
@@ -115,7 +115,7 @@ The seats are the game's own: the ones you can sit in when walking through a tra
 2. It goes by each group's role first (passenger, driver or guard), then its name (first class, standard class, driver's seat, steps and so on). Some trains (the Class 331 for one) leave the name at the game's default, which reads as "Engineer", so that name alone doesn't count. A multi-seat counts as passenger seating unless its role says otherwise. It leaves out cab seats, guard's seats, steps and ladders. If no seat on the train says what it is, any of them will do.
 3. It picks a random seat, preferring one with no passenger of the game's sitting in it, and never the one you're already in.
 4. It attaches the camera to the seat's vehicle, at the seat, so it rides with the train exactly. If the game won't attach it, the camera is moved to the seat every frame instead. The game lets go of a car's seats when the car is far off (the Rotem cars' beyond 80 m), and they drop to the world's origin and stay there; the mod places those where they belong on their car.
-5. It works out which way the seat faces by finding its back: a short line traced forward and back from the passenger's eyes hits the headrest on one side. If neither side hits anything, it goes by the seat's own rotation. Unreal's characters face their Y axis, and the Class 331's seats are turned that way.
+5. It works out which way the seat faces. Passengers sit side by side, so it first finds the seat beside this one: the nearest seat on the same vehicle, turned the same way, within 65 cm. If that seat is along the car, this seat is on a bench along the side and faces inward, across the car. Otherwise it faces along the car, and the mod finds its back: a short line traced forward and back from the passenger's eyes hits the headrest on one side. If neither side hits anything, it goes by the seat's own rotation. Unreal's characters face their Y axis, and the Class 331's seats are turned that way.
 6. Each frame, the passenger's head (`seat_head.lua`) decides where they look and how far it has moved. Where they look follows their seat and their window, whichever way the train goes. How their head leans and shakes follows the train: its speed and way of travel come from the vehicle's own velocity.
 
 If your vehicles won't list their seats, it searches every seat in the world and keeps those on your train. Seats more than 1 km from your vehicle are left out.
@@ -128,7 +128,7 @@ Everything the mod does is written to `ue4ss\UE4SS.log` in the game's Win64 fold
 - **Each spot:** how far ahead, how far to which side, the ground height, and whether the line and the train are in view, in the grass (how far over the ground the view went, and where) or hidden. Then how many spots it tried, the line traces that took, and how long. Before that, with `DebugLog` on, a `tried a spot` line for each spot it passed over.
 - **Every 2 seconds while on:** where the train is and how far it moved. Turn these off with `DebugLog = false`.
 - **The game taking the view:** each time, and what it switched to.
-- **Each seat:** which seat and vehicle, where the eyes went, which way it faces, whether the game had let go of its group, and whether the camera is attached. Before that, how many seats it found on your train, on other trains and away from the train.
+- **Each seat:** which seat and vehicle, where the eyes went, which way it faces (the way of travel, backwards or inward) and how that was told, whether the game had let go of its group, and whether the camera is attached. Before that, how many seats it found on your train, on other trains and away from the train.
 - **Every 2 seconds in a seat:** where the camera is and how far from the middle of its vehicle (it stays the same if the camera rides along properly), the speed, and how far round from the way of travel the passenger is looking.
 - **The mouse:** the first time it turns the seat view, or that it can't be read.
 
@@ -182,7 +182,11 @@ Pressing **F10** in a drive adds a report: which vehicle it would follow, everyt
 - 7 moved the camera to a new spot while on.
 - You said the camera sometimes ends up in the grass in narrow places. The log shows 7 pressed eight times in a row: each time the left was hidden and the spot on the right was 1 to 2 m up a bank. Grass doesn't stop a line trace, so the mod counted those views as clear. Since changed: a view running low over the ground counts as in the grass, and in narrow places the camera can stand 6 m from the line.
 
+**Seat view, 2026-10-24:**
+- You asked for the view from seats facing inward to look inward too. Before, the mod only worked out a seat facing along the car, so a seat along the side looked along the car and out of a window. Since changed: a seat whose neighbour is along the car faces inward, and the passenger looks across the car.
+
 **Still to see in the game:**
+- whether seats along the side are found facing inward (`it faces inward, across the car` in the log), and that seats in rows still face along the car
 - whether the camera keeps out of the grass now, and how long the spot checks take (`traces in ... ms` in the log)
 - the first spot on curves since that fix
 - the camera moving itself on once the train is past (every test so far was switched off first)

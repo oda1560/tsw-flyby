@@ -216,6 +216,28 @@ local function passenger_seats(taken)
     }
 end
 
+-- Eight seats in two rows facing each other, two each side of the aisle, side by side 50 cm apart.
+local function paired_seats(taken)
+    local seats = {}
+    for _, row in ipairs({ { 0, 0 }, { 180, 180 } }) do
+        for _, y in ipairs({ -85, -35, 35, 85 }) do
+            seats[#seats + 1] = { pos = vec(row[1], y, 45), face = row[2], taken = taken }
+        end
+    end
+    return seats
+end
+
+-- Eight seats on two benches along the sides of the car, 50 cm apart, facing inward across it.
+local function bench_seats(taken)
+    local seats = {}
+    for _, y in ipairs({ -130, 130 }) do
+        for i = 0, 3 do
+            seats[#seats + 1] = { pos = vec(-75 + 50 * i, y, 45), face = y > 0 and -90 or 90, taken = taken }
+        end
+    end
+    return seats
+end
+
 -- Whether a point (line coordinates) is in a seat's back: a box behind where its passenger sits, up to head height.
 -- None with opts.no_backs (seats the traces go through).
 seat_back_at = function(p)
@@ -362,7 +384,8 @@ function Sim.setup(opts)
     -- coaches' passenger seats, and the AI train's own. The seats' StandardSeatName and SeatRole: by default named;
     -- opts.unmarked: Generic, no role; opts.default_names: names left at 0 (Engineer), only the roles set, as the
     -- Class 331's are; opts.unset: neither set. opts.multiseat: each coach's seats a MultiSeatComponent, as the
-    -- Class 331's are, with neither set.
+    -- Class 331's are, with neither set. The coaches' seats: in rows of two facing each other (passenger_seats),
+    -- opts.pairs: two side by side each side of the aisle; opts.benches: on benches along the sides, facing inward.
     Sim.coaches = {}
     local train_models = { model }
     for i = 1, opts.coaches or 2 do
@@ -386,9 +409,10 @@ function Sim.setup(opts)
     if opts.unset or opts.multiseat then name, role = 0, 0 end
     local cab_seat = { pos = vec(0, 40, 90), face = 0, offset = vec(0, 0, 70) }
     seat_group(train, cab_name, cab_role, vec(600, 0, 0), 0, { cab_seat })
+    local seating = opts.benches and bench_seats or opts.pairs and paired_seats or passenger_seats
     for _, c in ipairs(Sim.coaches) do
-        seat_group(c.view, name, role, vec(-600, 0, 0), 0, passenger_seats(opts.taken), opts.multiseat)
-        seat_group(c.view, name, role, vec(300, 0, 0), 0, passenger_seats(opts.taken), opts.multiseat)
+        seat_group(c.view, name, role, vec(-600, 0, 0), 0, seating(opts.taken), opts.multiseat)
+        seat_group(c.view, name, role, vec(300, 0, 0), 0, seating(opts.taken), opts.multiseat)
     end
     seat_group(other, 6, 3, vec(0, 0, 0), 0, passenger_seats())
     if opts.seats_on_models then -- every seat on a model actor at the world's origin

@@ -845,6 +845,28 @@ class FlyBy(unittest.TestCase):
         self.start(self.still(), speed=20 * M, start=100 * M, socket_rotation=True)
         self.check_gaze()
 
+    def test_on_a_bench_along_the_side_the_passenger_looks_inward_across_the_car(self):
+        # Seats side by side along the car, as on a metro: whichever way the seats are turned, they face inward.
+        for turned in (False, True):
+            self.start(self.still(), benches=True, socket_rotation=turned, speed=20 * M, start=100 * M)
+            sides = set()
+            for _ in range(20):
+                self.sim.press("FOUR")
+                self.sim.run(1.0)
+                seat = self.seat()
+                sides.add(seat.pos.Y > 0)
+                self.assertAlmostEqual(self.wrap(self.view()[1] - seat.face), 0, delta=1.0)
+            self.assertEqual(sides, {True, False})              # both benches
+            self.assertRegex(self.logs(), r"it faces inward, across the car \(the seat beside it is 50 cm along the "
+                                          r"car\), the window behind them, -?130 cm from the middle of the car")
+            self.assertRegex(self.report(), r"looking [+-]90 degrees from the way of travel, the window behind them")
+            self.no_errors()
+
+    def test_seats_side_by_side_in_rows_still_look_along_the_car_out_of_the_window(self):
+        self.start(self.still(), pairs=True, speed=20 * M, start=100 * M)
+        self.check_gaze()
+        self.assertNotIn("inward", self.logs())
+
     def test_without_backs_to_find_it_guesses_the_way_from_the_seats_rotation(self):
         self.start(self.still(), speed=20 * M, start=100 * M, socket_rotation=True, no_backs=True)
         self.check_gaze()

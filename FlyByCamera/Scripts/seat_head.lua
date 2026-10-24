@@ -3,8 +3,8 @@
 -- in centimetres, times in seconds.
 --
 -- They look the way their seat faces along the car (ahead, or back the way the train has come in a backward seat),
--- turned towards the window nearest them. Their gaze wanders a little and now and then glances elsewhere for a few
--- seconds, no further round than a neck goes.
+-- turned towards the window nearest them; on a seat along the side of the car, facing inward, straight across it. Their
+-- gaze wanders a little and now and then glances elsewhere for a few seconds, no further round than a neck goes.
 -- Their head leans back as the train speeds up, forward as it brakes and out on curves, with a little spring in it,
 -- and shakes with the track, more the faster it goes. The mouse turns the view on top of all that; left alone, the
 -- gaze goes back to what it was doing.
@@ -17,7 +17,8 @@ local function wrap(a) return (a + 180) % 360 - 180 end
 local function clamp(x, lo, hi) return math.max(lo, math.min(hi, x)) end
 local function ease(dt, tau) return 1 - math.exp(-dt / tau) end
 
--- Glances, by their yaw from the way the seat faces towards the window side, and pitch
+-- Glances, by their yaw from the way the seat faces towards the window side (either side on a seat facing inward),
+-- and pitch
 local GLANCES = {
     { yaw = 90, pitch = -3 },    -- straight out of the window
     { yaw = 120, pitch = -4 },   -- along the train behind them, out of the window
@@ -82,8 +83,8 @@ end
 
 -- One frame. `f`: t, dt, travel (yaw of the way the train goes, nil if not known), speed (cm/s), facing (yaw the seat
 -- faces, nil if not known: then the way of travel), side (of the window nearest them, as they sit: 1 right, -1 left, 0
--- neither), mouse_dx, mouse_dy (the game's mouse movement). `s`: the settings. Returns the view's rotation
--- {Pitch, Yaw, Roll} and how far the head has moved from where it sits: {fwd (the way of travel), right, up}.
+-- neither, or behind them), mouse_dx, mouse_dy (the game's mouse movement). `s`: the settings. Returns the view's
+-- rotation {Pitch, Yaw, Roll} and how far the head has moved from where it sits: {fwd (the way of travel), right, up}.
 function H.step(h, f, s)
     local t = f.t
     local dt = clamp(f.dt or 0, 0, 0.1)
